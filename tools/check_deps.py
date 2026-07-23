@@ -122,7 +122,7 @@ def _pip_install(spec: str) -> int:
         "install",
         "--quiet",
         "--disable-pip-version-check",
-        spec,
+        *spec.split(),
     ]
     # ``spec`` é sempre construído a partir da nossa tabela interna
     # ``RUNTIME_REQUIRED``, não de input externo. O subprocess é seguro.

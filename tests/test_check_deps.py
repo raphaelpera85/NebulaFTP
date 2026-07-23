@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import types
+from unittest.mock import patch
 
 import pytest
 
@@ -68,9 +69,10 @@ def test_probe_for_missing_module_returns_missing():
 
 
 def test_ensure_runtime_dependencies_is_idempotent():
-    # If everything is already present (pytest env has them all), the
-    # function returns silently without touching pip.
-    deps.ensure_runtime_dependencies()
+    # Mock _probe so all modules appear installed; the function must
+    # return silently without touching pip.
+    with patch.object(deps, "_probe", return_value=(True, None)):
+        deps.ensure_runtime_dependencies()
 
 
 def test_ensure_runtime_dependencies_recovers_from_missing():
