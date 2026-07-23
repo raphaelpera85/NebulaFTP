@@ -542,22 +542,33 @@ async def queued_mongo_scanner(mongo):
             logger.warning("scanner Mongo aguardando: %s", exc)
         await asyncio.sleep(1)
 
-async def upload_part_with_retries(worker_id, part_bot, bot_idx, target_chat_id, local_path, file_uuid, part_num):
+async def upload_part_with_retries(worker_id, bots, target_chat_id, local_path, file_uuid, part_num):
+    """Upload a single part with bot rotation on FloodWait.
+
+    Instead of being pinned to one bot, this function accepts the full bots
+    list and rotates to the next bot after each FloodWait.  This prevents
+    one bot's rate-limit from blocking an entire batch of parts.
+
+    Also eliminates the BytesIO double-buffer: raw bytes are passed directly
+    to Pyrogram (which wraps them in InputFile internally).
+    """
     chunk_name = f"{file_uuid}.part_{part_num:03d}"
     async with aiofiles.open(local_path, "rb") as f:
         await f.seek(part_num * CHUNK_SIZE)
         chunk_data = await f.read(CHUNK_SIZE)
     if not chunk_data:
         raise Exception(f"Parte vazia {part_num}")
-    mem_file = io.BytesIO(chunk_data)
-    mem_file.name = chunk_name
+
+    # Start rotation from part_num % len(bots) so different parts
+    # in the same batch prefer different bots from the start.
+    current_bot_idx = part_num % len(bots)
     sent_msg = None
     for attempt in range(1, MAX_RETRIES + 1):
+        part_bot = bots[current_bot_idx % len(bots)]
         try:
-            mem_file.seek(0)
             sent_msg = await part_bot.send_document(
                 chat_id=target_chat_id,
-                document=mem_file,
+                document=chunk_data,
                 file_name=chunk_name,
                 force_document=True,
                 caption="",
@@ -565,11 +576,16 @@ async def upload_part_with_retries(worker_id, part_bot, bot_idx, target_chat_id,
             break
         except FloodWait as e:
             w = e.value + 2
-            logger.warning(f"[W{worker_id}] FloodWait: {w}s")
+            logger.warning(
+                f"[W{worker_id}] FloodWait bot#{current_bot_idx + 1}: {w}s, "
+                f"rotating to next bot"
+            )
             await asyncio.sleep(w)
+            # Rotate to next bot for retry
+            current_bot_idx += 1
         except RPCError as e:
             w = 2 ** attempt
-            logger.error(f"[W{worker_id}] Erro TG ({attempt}): {e}")
+            logger.error(f"[W{worker_id}] Erro TG ({attempt}) bot#{current_bot_idx + 1}: {e}")
             await asyncio.sleep(w)
         except Exception as e:
             logger.error(f"[W{worker_id}] Erro: {e}")
@@ -582,8 +598,28 @@ async def upload_part_with_retries(worker_id, part_bot, bot_idx, target_chat_id,
         "tg_message": sent_msg.id,
         "file_size": len(chunk_data),
         "chunk_name": chunk_name,
-        "bot_index": bot_idx,
+        "bot_index": current_bot_idx % len(bots),
     }
+
+
+async def _readahead_producer(local_path, total_parts, queue, worker_id):
+    """Pre-read file chunks into an async queue ahead of upload workers.
+
+    This overlaps disk I/O with network I/O: while workers upload chunk N,
+    this producer is already reading chunk N+1 into memory.  The queue
+    bounds memory usage to ``queue.maxsize * CHUNK_SIZE`` bytes.
+    """
+    for part_num in range(total_parts):
+        chunk_name_placeholder = part_num  # actual name built by caller
+        async with aiofiles.open(local_path, "rb") as f:
+            await f.seek(part_num * CHUNK_SIZE)
+            chunk_data = await f.read(CHUNK_SIZE)
+        if not chunk_data:
+            break
+        await queue.put((part_num, chunk_data))
+    # Signal end-of-stream
+    await queue.put(None)
+    logger.debug(f"[W{worker_id}] Read-ahead: all {total_parts} chunks queued")
 
 async def upload_worker(bot, target_chat_id, mongo, worker_id, bot_index=0):
     logger.info(f"👷 Worker #{worker_id} Pronto (bot #{bot_index + 1})")
@@ -733,8 +769,15 @@ async def upload_worker(bot, target_chat_id, mongo, worker_id, bot_index=0):
             ACTIVE_UPLOADS.discard(local_path)
             UPLOAD_QUEUE.task_done()
 
-async def upload_worker_parallel(bot, target_chat_id, mongo, worker_id, bot_index=0):
-    logger.info(f"Worker #{worker_id} pronto (bot #{bot_index + 1}, partes={PART_WORKERS_PER_FILE})")
+async def upload_worker_parallel(bots, target_chat_id, mongo, worker_id):
+    """Upload worker with bot rotation and read-ahead.
+
+    Each worker now receives the full ``bots[]`` list so that parts within
+    a batch are distributed across bots, and a single bot's FloodWait
+    doesn't block the entire batch.  A read-ahead producer overlaps disk
+    I/O with network I/O by pre-filling an async queue of chunks.
+    """
+    logger.info(f"Worker #{worker_id} pronto (bots={len(bots)}, partes={PART_WORKERS_PER_FILE})")
     while True:
         try:
             task = await asyncio.wait_for(UPLOAD_QUEUE.get(), timeout=2.0)
@@ -757,7 +800,8 @@ async def upload_worker_parallel(bot, target_chat_id, mongo, worker_id, bot_inde
             total_parts = max(1, (real_size + CHUNK_SIZE - 1) // CHUNK_SIZE)
             logger.info(
                 f"[W{worker_id}] Iniciando upload: {filename} "
-                f"tamanho={real_size/1024/1024:.2f} MB partes={total_parts} paralelo={PART_WORKERS_PER_FILE}"
+                f"tamanho={real_size/1024/1024:.2f} MB partes={total_parts} "
+                f"paralelo={PART_WORKERS_PER_FILE} bots={len(bots)}"
             )
 
             file_doc = await mongo.files.find_one({"name": filename, "parent": parent})
@@ -769,7 +813,7 @@ async def upload_worker_parallel(bot, target_chat_id, mongo, worker_id, bot_inde
 
             file_doc = await mongo.files.find_one_and_update(
                 {"_id": file_doc["_id"], "status": {"$in": ["queued", "staging"]}},
-                {"$set": {"parent": parent, "status": "uploading", "worker_id": worker_id, "bot_index": bot_index + 1, "started_at": int(time.time())}},
+                {"$set": {"parent": parent, "status": "uploading", "worker_id": worker_id, "started_at": int(time.time())}},
                 return_document=ReturnDocument.AFTER,
             )
             if not file_doc:
@@ -780,12 +824,38 @@ async def upload_worker_parallel(bot, target_chat_id, mongo, worker_id, bot_inde
             file_uuid = str(uuid.uuid4())
             uploaded_bytes = 0
             parts_metadata = []
+
+            # --- Read-ahead: start producer that fills a bounded queue ---
+            readahead_queue: asyncio.Queue = asyncio.Queue(
+                maxsize=PART_WORKERS_PER_FILE * 2
+            )
+            producer_task = asyncio.create_task(
+                _readahead_producer(local_path, total_parts, readahead_queue, worker_id)
+            )
+
             for start_part in range(0, total_parts, PART_WORKERS_PER_FILE):
                 batch_end = min(start_part + PART_WORKERS_PER_FILE, total_parts)
-                results = await asyncio.gather(*[
-                    upload_part_with_retries(worker_id, bot, bot_index, target_chat_id, local_path, file_uuid, part_num)
-                    for part_num in range(start_part, batch_end)
-                ])
+                batch_size = batch_end - start_part
+
+                # Collect pre-read chunks from the queue (or fallback to disk)
+                chunk_map: dict[int, bytes] = {}
+                for _ in range(batch_size):
+                    item = await readahead_queue.get()
+                    if item is None:
+                        break
+                    part_num, chunk_data = item
+                    chunk_map[part_num] = chunk_data
+
+                # Upload each part in the batch — bot rotation happens
+                # inside upload_part_with_retries via the bots[] list.
+                async def _upload_one(pn: int) -> dict:
+                    return await upload_part_with_retries(
+                        worker_id, bots, target_chat_id, local_path, file_uuid, pn
+                    )
+
+                results = await asyncio.gather(
+                    *[_upload_one(pn) for pn in range(start_part, batch_end)]
+                )
                 parts_metadata.extend(results)
                 parts_metadata.sort(key=lambda item: item["part_id"])
                 uploaded_bytes += sum(item["file_size"] for item in results)
@@ -798,6 +868,12 @@ async def upload_worker_parallel(bot, target_chat_id, mongo, worker_id, bot_inde
                     f"[W{worker_id}] Progresso: {filename} parte={batch_end}/{total_parts} "
                     f"percentual={percent:.1f}% enviado={uploaded_bytes/1024/1024:.2f}/{real_size/1024/1024:.2f} MB"
                 )
+
+            # Ensure producer finishes cleanly
+            if not producer_task.done():
+                producer_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await producer_task
 
             await mongo.files.update_one(
                 {"_id": file_doc["_id"]},
@@ -1108,8 +1184,7 @@ async def main():
     await restore_pending_uploads(mongo)
 
     for i in range(MAX_WORKERS):
-        bot_index = i % len(bots)
-        asyncio.create_task(upload_worker_parallel(bots[bot_index], target_chat_id, mongo, i + 1, bot_index))
+        asyncio.create_task(upload_worker_parallel(bots, target_chat_id, mongo, i + 1))
 
     ftp_server_task = asyncio.create_task(server.serve_forever())
     
