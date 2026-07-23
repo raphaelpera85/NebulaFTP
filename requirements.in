@@ -1,0 +1,22 @@
+# Source-of-truth constraints; regenerate requirements.txt with pip-compile.
+# pip-compile --output-file=requirements.txt requirements.in
+
+bcrypt
+cryptography
+dnspython
+motor
+pyftpdlib
+pyrogram
+pymongo
+python-dotenv
+aiofiles
+tgcrypto
+aiohttp
+pyaes
+pysocks
+
+# Dev / test (move to requirements-dev.txt for CI separation)
+pytest
+pytest-asyncio
+ruff
+mypy

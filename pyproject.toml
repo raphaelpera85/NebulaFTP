@@ -1,0 +1,33 @@
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+extend-exclude = ["staging", ".venv", "build", "dist"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "ASYNC", "S", "PL"]
+ignore = [
+    "PLR0913",  # too many arguments (acceptable in async dispatch)
+    "PLR2004",  # magic value (limit ID literals are intentional)
+    "S101",     # asserts allowed in tests
+    "PLW2901", # loop variable overwrite is intended in some hot paths
+]
+
+[tool.ruff.lint.per-file-ignores]
+"main.py" = ["S104"]  # 0.0.0.0 intended
+"ftp/pathio.py" = ["S104"]
+"ftp/server.py" = ["S104"]
+
+[tool.mypy]
+python_version = "3.12"
+warn_unused_ignores = true
+warn_redundant_casts = true
+ignore_missing_imports = true
+disallow_untyped_defs = false
+
+[[tool.mypy.overrides]]
+module = "pyrogram.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "motor.*"
+ignore_missing_imports = true

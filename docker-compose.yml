@@ -1,0 +1,82 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nebula_ftp
+    restart: unless-stopped
+    # Internal bridge network; only FTP control + passive ports are exposed.
+    networks:
+      - nebula_net
+    ports:
+      # Adjust the host port if you change `PORT` below.
+      - "${HOST_FTP_PORT:-2121}:2121"
+      # Restrict passive port range to match PASSIVE_PORTS (default 10 ports).
+      - "60000-60009:60000-60009"
+    volumes:
+      - ./staging:/app/staging
+      # Session file permission MUST be 0600 or the bot identity is stealable.
+      # `nebula_session:/app/FTP_Bot.session` is the recommended named-volume
+      # path so the file is owned by the non-root container user.
+      - nebula_session:/app/FTP_Bot.session:rw
+      - nebula_logs:/app/nebula.log
+      - ./.env:/app/.env:ro
+    environment:
+      - MONGODB=mongodb://nebula_mongo:27017
+      - HOST=0.0.0.0
+      - PORT=2121
+      - PASSIVE_PORTS=60000-60009
+      # Toggle TLS by providing these two env vars (see .env.example):
+      - TLS_CERTFILE=${TLS_CERTFILE:-}
+      - TLS_KEYFILE=${TLS_KEYFILE:-}
+      - TLS_REQUIRE_CLIENT_CERT=${TLS_REQUIRE_CLIENT_CERT:-false}
+      - BCRYPT_ROUNDS=${BCRYPT_ROUNDS:-12}
+      - GC_INTERVAL_SECONDS=${GC_INTERVAL_SECONDS:-60}
+      - PATHIO_CACHE_MAXSIZE=${PATHIO_CACHE_MAXSIZE:-10000}
+    depends_on:
+      - mongo
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "python -c \"import socket; s=socket.socket(); s.settimeout(2); s.connect(('127.0.0.1', 2121)); s.sendall(b'QUIT\\r\\n'); print(s.recv(64).decode()[:80])\" || exit 1"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  mongo:
+    image: mongo:7
+    container_name: nebula_mongo
+    restart: unless-stopped
+    networks:
+      - nebula_net
+    # Bind ONLY to the bridge interface on the host; never expose by default.
+    # Remove the `ports:` block to keep Mongo fully internal.
+    ports:
+      - "127.0.0.1:27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    environment:
+      # Set MONGO_INITDB_ROOT_USERNAME + password for production!
+      - MONGO_INITDB_ROOT_USERNAME=${MONGO_ROOT_USER:-}
+      - MONGO_INITDB_ROOT_PASSWORD=${MONGO_ROOT_PASSWORD:-}
+    healthcheck:
+      test:
+        - CMD
+        - mongosh
+        - --quiet
+        - --eval
+        - "db.adminCommand('ping').ok"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+networks:
+  nebula_net:
+    driver: bridge
+
+volumes:
+  mongo_data:
+  nebula_session:
+  nebula_logs:

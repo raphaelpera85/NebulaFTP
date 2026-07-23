@@ -1,0 +1,57 @@
+# Environment & secrets
+.env
+.env.*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+build/
+dist/
+
+# Session files
+*.session*
+nebula_session/
+
+# Logs
+*.log
+*.log.*
+
+# Runtime state
+feed_ftp_state.json
+media_completed.xlsx
+
+# STRM library (generated, not source)
+strm_library/
+
+# Local tool configs (may contain credentials)
+rclone-nebula.conf
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test / CI caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+staging/
+
+# Virtual environments
+.venv/
+venv/
+
+# Opencode / agent files (not part of project source)
+.agents/
+skills-lock.json
+nebula_context.md
+.planning/
+
+# Opencode binary
+Telegram
