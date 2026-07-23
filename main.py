@@ -568,7 +568,7 @@ async def upload_part_with_retries(worker_id, bots, target_chat_id, local_path, 
         try:
             sent_msg = await part_bot.send_document(
                 chat_id=target_chat_id,
-                document=chunk_data,
+                document=io.BytesIO(chunk_data),
                 file_name=chunk_name,
                 force_document=True,
                 caption="",

@@ -1,8 +1,9 @@
-"""Tests for upload pipeline: bot rotation, read-ahead, BytesIO elimination."""
+"""Tests for upload pipeline: bot rotation, read-ahead, BytesIO wrapping."""
 from __future__ import annotations
 
 import asyncio
 import importlib.util
+import io
 import os
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -259,8 +260,8 @@ class TestBotRotation:
         bot1.send_document.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_raw_bytes_no_bytesio(self, tmp_path):
-        """Verify send_document receives raw bytes, not io.BytesIO."""
+    async def test_send_document_uses_bytesio(self, tmp_path):
+        """Verify send_document receives io.BytesIO (pyrogram needs file-like with .read())."""
         CHUNK_SIZE = 1024
         main_mod.CHUNK_SIZE = CHUNK_SIZE
 
@@ -283,9 +284,10 @@ class TestBotRotation:
 
         call_kwargs = bot0.send_document.call_args
         document_arg = call_kwargs.kwargs.get("document") or call_kwargs[1].get("document")
-        # Must be raw bytes, not BytesIO or IO wrapper
-        assert isinstance(document_arg, (bytes, bytearray))
-        assert len(document_arg) == CHUNK_SIZE
+        # Must be io.BytesIO — pyrogram requires a file-like object with .read()
+        assert isinstance(document_arg, io.BytesIO)
+        document_arg.seek(0)
+        assert document_arg.read() == data
 
     @pytest.mark.asyncio
     async def test_empty_chunk_raises(self, tmp_path):
