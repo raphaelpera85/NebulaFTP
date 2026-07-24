@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import mimetypes
 import json
 import os
 import queue
 import re
 import shutil
+import tempfile
 import sys
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
+from urllib.request import urlopen
 
 from dotenv import load_dotenv
 from pymongo import MongoClient
@@ -20,6 +25,7 @@ UPLOADABLE_EXTENSIONS = {
     ".mkv", ".mp4", ".avi", ".mov", ".wmv", ".m4v",
     ".sub", ".ass", ".ssa", ".vtt",
 }
+MONITORED_EXTENSIONS = UPLOADABLE_EXTENSIONS | {".strm"}
 ACTIVE_STATUSES = ("staging", "queued", "uploading")
 EPISODE_RE = re.compile(r"(?i)(?P<prefix>.*?)(?:[.\s_-]+)?s(?P<season>\d{1,2})e(?P<episode>\d{1,3})")
 
@@ -33,20 +39,44 @@ class Stats:
     bytes_copied: int = 0
 
 
-def is_video(path: Path) -> bool:
-    return path.suffix.lower() in UPLOADABLE_EXTENSIONS
+def is_monitored(path: Path) -> bool:
+    suffix = path.suffix.lower()
+    if suffix in {".download", ".partial"}:
+        return False
+    return suffix in MONITORED_EXTENSIONS
 
 
-def iter_files(source: Path, all_files: bool, exclude_dirs: set[str]):
-    for root, _, files in os.walk(source):
-        root_path = Path(root)
-        rel_parts = root_path.relative_to(source).parts
-        if rel_parts and rel_parts[0].lower() in exclude_dirs:
-            continue
-        for name in files:
-            src = root_path / name
-            if all_files or is_video(src):
-                yield src
+def split_source_paths(raw_sources: list[str] | None) -> list[Path]:
+    raw_sources = raw_sources or [r"E:\\"]
+    paths: list[Path] = []
+    seen: set[str] = set()
+    for raw in raw_sources:
+        for chunk in re.split(r"[;\n,]", raw):
+            value = chunk.strip().strip('"')
+            if not value:
+                continue
+            resolved = Path(value).expanduser().resolve()
+            key = str(resolved).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            paths.append(resolved)
+    return paths
+
+
+def iter_files(sources: list[Path], all_files: bool, exclude_dirs: set[str]):
+    for source in sources:
+        for root, _, files in os.walk(source):
+            root_path = Path(root)
+            rel_parts = root_path.relative_to(source).parts
+            if rel_parts and rel_parts[0].lower() in exclude_dirs:
+                continue
+            for name in files:
+                src = root_path / name
+                if src.suffix.lower() in {".download", ".partial"}:
+                    continue
+                if all_files or is_monitored(src):
+                    yield source, src
 
 
 def load_seen(path: Path) -> set[str]:
@@ -68,6 +98,53 @@ def mark_seen(src: Path, seen: set[str] | None, state_file: Path | None) -> None
     seen.add(str(src))
     if state_file:
         save_seen(state_file, seen)
+
+
+def read_strm_url(src: Path) -> str:
+    text = src.read_text(encoding="utf-8-sig", errors="replace")
+    for line in text.splitlines():
+        value = line.strip()
+        if value:
+            return value
+    raise ValueError(f"Arquivo .strm vazio: {src}")
+
+
+def guess_media_extension(url: str, content_type: str | None = None) -> str:
+    ext = Path(urlsplit(url).path).suffix.lower()
+    if ext and len(ext) <= 8:
+        return ext
+    if content_type:
+        guessed = mimetypes.guess_extension(content_type.split(";", 1)[0].strip().lower())
+        if guessed:
+            return ".jpg" if guessed == ".jpe" else guessed
+    return ".mp4"
+
+
+def materialize_strm(src: Path, overwrite: bool = False) -> Path:
+    url = read_strm_url(src)
+    parsed = urlsplit(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError(f"URL .strm invalida: {url}")
+
+    target_name = f"{src.stem}{guess_media_extension(url)}"
+    target = src.with_name(target_name)
+    if target.exists() and not overwrite:
+        src.unlink(missing_ok=True)
+        return target
+
+    fd, tmp_name = tempfile.mkstemp(dir=str(src.parent), prefix=f".{src.stem}.", suffix=".download")
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        with urlopen(url, timeout=120) as response, tmp_path.open("wb") as out:
+            shutil.copyfileobj(response, out, length=1024 * 1024)
+        tmp_path.replace(target)
+        src.unlink(missing_ok=True)
+        return target
+    except Exception:
+        with contextlib.suppress(FileNotFoundError):
+            tmp_path.unlink()
+        raise
 
 
 def active_count(mongo_uri: str) -> int:
@@ -293,7 +370,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Alimenta o Nebula preservando pastas."
     )
-    parser.add_argument("--source", default="E:\\", help="Origem. Padrao: E:\\")
+    parser.add_argument("--source", action="append", default=[], help="Origem. Pode repetir ou separar por ;, ou ,")
     parser.add_argument("--dest", default=".nebula_virtual_root", help="Raiz virtual do Nebula. No modo direto nao precisa existir.")
     parser.add_argument("--workers", type=int, default=2, help="Copias paralelas. Padrao: 2")
     parser.add_argument("--overwrite", action="store_true", help="Sobrescreve destino existente.")
@@ -308,17 +385,23 @@ def main() -> int:
     parser.add_argument("--delete-source", action="store_true", help="Exclui o arquivo de origem apos mover/enfileirar com sucesso.")
     args = parser.parse_args()
 
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    for stream in (sys.stdout, sys.stderr):
+        reconfig = getattr(stream, "reconfigure", None)
+        if callable(reconfig):
+            reconfig(encoding="utf-8", errors="replace")
 
-    source = Path(args.source).resolve()
     dest = Path(args.dest).resolve()
-    if not source.exists():
-        print(f"Origem nao existe: {source}")
-        return 2
     if not args.direct_mongo and not dest.exists():
         print(f"Destino nao existe ou FTP nao montado: {dest}")
+        return 2
+
+    sources = split_source_paths(args.source)
+    if not sources:
+        print("Nenhuma origem informada.")
+        return 2
+    missing_sources = [src for src in sources if not src.exists()]
+    if missing_sources:
+        print("Origem nao existe: " + ", ".join(str(src) for src in missing_sources))
         return 2
 
     jobs: queue.Queue[tuple[Path, Path] | None] = queue.Queue(maxsize=args.workers * 4)
@@ -329,6 +412,8 @@ def main() -> int:
     pending: set[str] = set()
     state_file = Path(args.state_file)
     seen = load_seen(state_file) if args.watch else None
+    last_watch_snapshot: tuple[int, int, int] | None = None
+    last_idle_notice = 0.0
 
     load_dotenv()
     mongo_uri = os.getenv("MONGODB", "mongodb://localhost:27017")
@@ -365,14 +450,14 @@ def main() -> int:
         # Conta mídias pendentes físicas no disco antes de filtrar por slots livres
         all_unseen = []
         try:
-            for src in iter_files(source, args.all_files, exclude_dirs):
+            for source_root, src in iter_files(sources, args.all_files, exclude_dirs):
                 src_key = str(src)
                 if seen is not None and src_key in seen:
                     continue
                 with lock:
                     if src_key in pending:
                         continue
-                all_unseen.append(src)
+                all_unseen.append((source_root, src))
         except Exception as exc:
             print(f"Erro ao escanear origem: {exc}", flush=True)
 
@@ -383,7 +468,7 @@ def main() -> int:
             client = MongoClient(mongo_uri, serverSelectionTimeoutMS=3000)
             client.ftp.stats.update_one(
                 {"_id": "feeder"},
-                {"$set": {"source": str(source), "pending_disk_files": remaining_count, "updated_at": int(time.time())}},
+                {"$set": {"source": " | ".join(str(src) for src in sources), "pending_disk_files": remaining_count, "updated_at": int(time.time())}},
                 upsert=True
             )
             client.close()
@@ -395,7 +480,15 @@ def main() -> int:
             try:
                 active = active_count(mongo_uri)
                 free_slots = max(args.max_active - active, 0)
-                print(f"Fila Nebula: ativos={active} limite={args.max_active} livres={free_slots} | Pendentes no disco: {remaining_count}", flush=True)
+                snapshot = (active, free_slots, remaining_count)
+                now = time.monotonic()
+                if snapshot != last_watch_snapshot or now - last_idle_notice >= args.poll_seconds * 5:
+                    print(
+                        f"Fila Nebula: ativos={active} limite={args.max_active} livres={free_slots} | Pendentes no disco: {remaining_count}",
+                        flush=True,
+                    )
+                    last_watch_snapshot = snapshot
+                    last_idle_notice = now
                 if free_slots <= 0:
                     time.sleep(args.poll_seconds)
                     continue
@@ -405,12 +498,20 @@ def main() -> int:
                 continue
 
         added = 0
-        for src in all_unseen:
+        for source_root, src in all_unseen:
             src_key = str(src)
+            if src.suffix.lower() == ".strm":
+                try:
+                    materialized = materialize_strm(src, overwrite=args.overwrite)
+                    print(f"[STRM] Materializado: {src} -> {materialized}", flush=True)
+                    mark_seen(src, seen, state_file)
+                except Exception as exc:
+                    print(f"[STRM] Falha ao materializar {src}: {exc}", flush=True)
+                continue
             with lock:
                 stats.queued += 1
                 pending.add(src_key)
-            jobs.put((src, destination_for(source, dest, src)))
+            jobs.put((src, destination_for(source_root, dest, src)))
             added += 1
             if args.watch and added >= free_slots:
                 break
@@ -418,7 +519,7 @@ def main() -> int:
         if not args.watch:
             break
         if added == 0:
-            print(f"Nada novo para alimentar; aguardando {args.poll_seconds}s | Pendentes no disco: {remaining_count}", flush=True)
+            pass
         time.sleep(args.poll_seconds)
 
     for _ in threads:

@@ -290,6 +290,32 @@ class TestBotRotation:
         assert document_arg.read() == data
 
     @pytest.mark.asyncio
+    async def test_chunk_data_shortcuts_disk_read(self, tmp_path):
+        """Providing chunk_data should skip reopening the file."""
+        CHUNK_SIZE = 1024
+        main_mod.CHUNK_SIZE = CHUNK_SIZE
+
+        data = b"c" * 1024
+        fpath = tmp_path / "file.bin"
+        fpath.write_bytes(data)
+
+        bot0 = _make_bot("bot0")
+        bot0.send_document.return_value = _make_sent_msg("f0", 1)
+
+        with patch.object(main_mod.aiofiles, "open") as mock_open:
+            await upload_part_with_retries(
+                worker_id=1,
+                bots=[bot0],
+                target_chat_id="chat1",
+                local_path=str(fpath),
+                file_uuid="uuid-test",
+                part_num=0,
+                chunk_data=data,
+            )
+
+        mock_open.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_empty_chunk_raises(self, tmp_path):
         """Reading past EOF should raise."""
         CHUNK_SIZE = 1024
@@ -528,6 +554,7 @@ class TestUploadIntegration:
                 local_path=str(fpath),
                 file_uuid="uuid-integ",
                 part_num=part_num,
+                chunk_data=chunk_data,
             )
             results.append(result)
 

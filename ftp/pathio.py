@@ -16,7 +16,7 @@ from uuid import uuid4
 import aiofiles
 
 try:
-    from pymongo.errors import ConnectionFailure, PyMongoError, ServerSelectionTimeoutError
+    from pymongo.errors import ConnectionFailure, DuplicateKeyError, PyMongoError, ServerSelectionTimeoutError
 except ImportError:
     # Fallbacks if pymongo not installed (e.g., test-only env): widen defensively
     class _PyMongoError(Exception):
@@ -25,7 +25,10 @@ except ImportError:
         pass
     class _ServerSelectionTimeoutError(_PyMongoError):
         pass
+    class _DuplicateKeyError(_PyMongoError):
+        pass
     ConnectionFailure = _ConnectionFailure
+    DuplicateKeyError = _DuplicateKeyError
     ServerSelectionTimeoutError = _ServerSelectionTimeoutError
     PyMongoError = _PyMongoError
 
@@ -270,6 +273,12 @@ class MongoDBPathIO(AbstractPathIO):
     _cache_lock = Lock()
     Stats = namedtuple("Stats", ("st_size", "st_ctime", "st_mtime", "st_nlink", "st_mode"))
 
+    @property
+    def _files(self):
+        if self.db is None:
+            raise PathIOError("Banco de dados MongoDB nao foi inicializado")
+        return self.db.files
+
     def __init__(self, *args, state=None, cwd=None, **kwargs):
         super().__init__(*args, **kwargs); self.cwd = PurePosixPath("/")
 
@@ -299,7 +308,10 @@ class MongoDBPathIO(AbstractPathIO):
             if cache_key in self._memory_cache:
                 return Node(**self._memory_cache[cache_key])
 
-        node = await self.db.files.find_one({"name": name, "parent": parent})
+        if self.db is None:
+            return None
+
+        node = await self._files.find_one({"name": name, "parent": parent})
         if node:
             async with self._cache_lock: self._memory_cache[cache_key] = node
             return Node(**node)
@@ -307,7 +319,7 @@ class MongoDBPathIO(AbstractPathIO):
         # Fallback
         if parent.startswith("/") and parent != "/":
             alt = parent[1:]
-            node = await self.db.files.find_one({"name": name, "parent": alt})
+            node = await self._files.find_one({"name": name, "parent": alt})
             if node:
                 async with self._cache_lock: self._memory_cache[cache_key] = node
                 return Node(**node)
@@ -336,7 +348,7 @@ class MongoDBPathIO(AbstractPathIO):
         doc = {"type": "dir", "ctime": int(time()), "mtime": int(time()), "name": name, "parent": parent, "size": 0}
         key = f"{parent}::{name}"
         try:
-            await self.db.files.insert_one(doc)
+            await self._files.insert_one(doc)
         except DuplicateKeyError:
             # Lost the race against a concurrent insert. Treat as success
             # only when the caller opted into exist_ok=True; otherwise we
@@ -362,12 +374,12 @@ class MongoDBPathIO(AbstractPathIO):
         parent, name = self._split_path(path)
         key = f"{parent}::{name}"
         async with self._cache_lock: self._memory_cache.pop(key, None)
-        await self.db.files.delete_one({"name": name, "parent": parent})
+        await self._files.delete_one({"name": name, "parent": parent})
         full = f"{parent}/{name}" if parent != "/" else f"/{name}"
         # Escape any regex metacharacters in the path so sibling trees
         # whose names happen to share a prefix (e.g. /Foo vs /FooBar)
         # are not also wiped out.
-        await self.db.files.delete_many({"parent": {"$regex": f"^{re.escape(full)}"}})
+        await self._files.delete_many({"parent": {"$regex": f"^{re.escape(full)}"}})
 
     @universal_exception
     async def unlink(self, path):
@@ -375,13 +387,13 @@ class MongoDBPathIO(AbstractPathIO):
         node = await self.get_node(path)
         if node:
             async with self._cache_lock: self._memory_cache.pop(f"{node.parent}::{node.name}", None)
-            raw = await self.db.files.find_one({"name": node.name, "parent": node.parent})
+            raw = await self._files.find_one({"name": node.name, "parent": node.parent})
             if raw and "local_path" in raw and os.path.exists(raw["local_path"]):
                 try:
                     os.remove(raw["local_path"])
                 except OSError as exc:
                     logger.debug("unlink local file skipped (%s): %s", node.name, exc)
-            await self.db.files.delete_one({"name": node.name, "parent": node.parent})
+            await self._files.delete_one({"name": node.name, "parent": node.parent})
 
     def list(self, path):
         path = self._absolute(path)
@@ -395,7 +407,7 @@ class MongoDBPathIO(AbstractPathIO):
             @universal_exception
             async def __anext__(cls):
                 if cls.iter is None:
-                    cls.iter = self.db.files.find({"parent": search, "name": {"$not": {"$regex": r"\.partial$"}}})
+                    cls.iter = self._files.find({"parent": search, "name": {"$not": {"$regex": r"\.partial$"}}})
                 try:
                     doc = await cls.iter.__anext__()
                     return path / doc["name"]
@@ -416,7 +428,7 @@ class MongoDBPathIO(AbstractPathIO):
         if mode == "wb":
             doc = {"type": "file", "ctime": int(time()), "mtime": int(time()), "name": name, "parent": parent, "size": 0, "parts": []}
             async with self._cache_lock: self._memory_cache[f"{parent}::{name}"] = doc
-            await self.db.files.replace_one({"name": name, "parent": parent}, doc, upsert=True)
+            await self._files.replace_one({"name": name, "parent": parent}, doc, upsert=True)
         
         node = await self.get_node(path)
         if not node and mode == "rb": raise FileNotFoundError
@@ -439,25 +451,25 @@ class MongoDBPathIO(AbstractPathIO):
             src_doc = self._memory_cache.get(old_key)
         
         if not src_doc:
-            src_doc = await self.db.files.find_one({"name": src_n, "parent": src_p})
+            src_doc = await self._files.find_one({"name": src_n, "parent": src_p})
         
         if not src_doc:
             logger.warning(f"⚠️ [RENAME] Origem não encontrada: {source}")
             return 
 
-        existing_dst = await self.db.files.find_one({"name": dst_n, "parent": dst_p})
+        existing_dst = await self._files.find_one({"name": dst_n, "parent": dst_p})
         if existing_dst and existing_dst.get("_id") != src_doc.get("_id"):
             if existing_dst.get("type") == "dir" and src_doc.get("type") == "dir":
                 async with self._cache_lock:
                     self._memory_cache.pop(old_key, None)
-                await self.db.files.delete_one({"_id": src_doc["_id"]})
+                await self._files.delete_one({"_id": src_doc["_id"]})
                 return
             if existing_dst.get("local_path") and os.path.exists(existing_dst["local_path"]):
                 try:
                     os.remove(existing_dst["local_path"])
                 except OSError as exc:
                     logger.debug("overwrite local cleanup skipped (%s): %s", dst_n, exc)
-            await self.db.files.delete_one({"_id": existing_dst["_id"]})
+            await self._files.delete_one({"_id": existing_dst["_id"]})
 
         # 2. Atualiza Cache Atomicamente
         async with self._cache_lock:
@@ -471,7 +483,7 @@ class MongoDBPathIO(AbstractPathIO):
             self._memory_cache[new_key] = src_doc
 
         # 3. Atualiza DB
-        await self.db.files.update_one(
+        await self._files.update_one(
             {"_id": src_doc["_id"]}, 
             {"$set": {"name": dst_n, "parent": dst_p, "mtime": int(time())}}
         )
@@ -480,7 +492,7 @@ class MongoDBPathIO(AbstractPathIO):
         if src_n.endswith(".partial") and not dst_n.endswith(".partial"):
             local_p = src_doc.get("local_path")
             if not is_uploadable_name(dst_n):
-                await self.db.files.update_one(
+                await self._files.update_one(
                     {"_id": src_doc["_id"]},
                     {"$set": {"status": "completed"}, "$unset": {"local_path": 1}}
                 )

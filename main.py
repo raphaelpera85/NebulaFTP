@@ -31,6 +31,7 @@ from html import escape
 from logging.handlers import RotatingFileHandler
 from os import environ
 from os.path import exists
+from typing import Any
 from urllib.parse import parse_qs, quote, urlsplit
 
 import aiofiles
@@ -49,7 +50,7 @@ for stream in (sys.stdout, sys.stderr):
     if hasattr(stream, "reconfigure"):
         stream.reconfigure(encoding="utf-8", errors="replace")
 
-pyrogram_utils.MIN_CHANNEL_ID = min(pyrogram_utils.MIN_CHANNEL_ID, -1009999999999)
+pyrogram_utils.MIN_CHANNEL_ID = min(pyrogram_utils.MIN_CHANNEL_ID, -1009999999999)  # type: ignore
 
 if exists(".env"):
     from dotenv import load_dotenv
@@ -64,7 +65,7 @@ CHUNK_SIZE = CHUNK_SIZE_MB * 1024 * 1024
 MAX_RETRIES = int(environ.get("MAX_RETRIES", 5))
 MAX_STAGING_AGE = int(environ.get("MAX_STAGING_AGE", 3600))
 MAX_WORKERS = int(environ.get("MAX_WORKERS", 4))
-PART_WORKERS_PER_FILE = max(1, int(environ.get("PART_WORKERS_PER_FILE", 1)))
+PART_WORKERS_PER_FILE = max(1, int(environ.get("PART_WORKERS_PER_FILE", 2)))
 UPLOAD_STATUS_MESSAGES = environ.get("UPLOAD_STATUS_MESSAGES", "false").lower() in ("1", "true", "yes")
 STREAM_HOST = environ.get("STREAM_HOST", "127.0.0.1")
 STREAM_PORT = int(environ.get("STREAM_PORT", 2122))
@@ -201,7 +202,7 @@ class Metrics:
     @classmethod
     def report(cls):
         mb = cls.bytes_uploaded / (1024*1024)
-        logger.info(f"Stats runtime: enviados={cls.uploads_total} volume={mb:.2f} MB falhas={cls.uploads_failed}")
+        logger.debug(f"Stats runtime: enviados={cls.uploads_total} volume={mb:.2f} MB falhas={cls.uploads_failed}")
 
 async def log_queue_state(mongo, event):
     try:
@@ -228,7 +229,12 @@ async def log_queue_state(mongo, event):
         except Exception:
             pass
 
-        logger.info(
+        log_fn = logger.info
+        if event == "intervalo":
+            log_fn = logger.debug
+        elif event.startswith(("enfileirado:", "reenfileirado:")):
+            log_fn = logger.debug
+        log_fn(
             "Fila: evento=%s stage=%s fila=%s enviando=%s enviados=%s falhas=%s faltam=%s (no disco=%s)",
             event, staging, queued, uploading, completed, failed, pending, pending_disk
         )
@@ -446,7 +452,7 @@ async def folder_watcher(mongo):
                         await UPLOAD_QUEUE.put({
                             "path": fp, "filename": display_name, "parent": parent_path, "size": size_t1
                         })
-                        logger.info(f"Reenfileirado: {display_name}")
+                        logger.debug(f"Reenfileirado: {display_name}")
                         await log_queue_state(mongo, f"reenfileirado:{display_name}")
                     elif not doc:
                         await asyncio.sleep(2)
@@ -455,7 +461,7 @@ async def folder_watcher(mongo):
                         except FileNotFoundError:
                             continue
 
-                        logger.info(f"Detectado: {display_name} -> {parent_path}")
+                        logger.debug(f"Detectado: {display_name} -> {parent_path}")
                         
                         if parent_path != "/":
                             parts = parent_path.strip("/").split("/")
@@ -480,7 +486,7 @@ async def folder_watcher(mongo):
                             await UPLOAD_QUEUE.put({
                                 "path": fp, "filename": display_name, "parent": parent_path, "size": size_t1
                             })
-                            logger.info(f"Enfileirado: {display_name}")
+                            logger.debug(f"Enfileirado: {display_name}")
                             await log_queue_state(mongo, f"enfileirado:{display_name}")
                         except Exception as e:
                             logger.warning(f"Erro registro {display_name}: {e}")
@@ -542,7 +548,7 @@ async def queued_mongo_scanner(mongo):
             logger.warning("scanner Mongo aguardando: %s", exc)
         await asyncio.sleep(1)
 
-async def upload_part_with_retries(worker_id, bots, target_chat_id, local_path, file_uuid, part_num):
+async def upload_part_with_retries(worker_id, bots, target_chat_id, local_path, file_uuid, part_num, chunk_data=None):
     """Upload a single part with bot rotation on FloodWait.
 
     Instead of being pinned to one bot, this function accepts the full bots
@@ -553,9 +559,10 @@ async def upload_part_with_retries(worker_id, bots, target_chat_id, local_path, 
     to Pyrogram (which wraps them in InputFile internally).
     """
     chunk_name = f"{file_uuid}.part_{part_num:03d}"
-    async with aiofiles.open(local_path, "rb") as f:
-        await f.seek(part_num * CHUNK_SIZE)
-        chunk_data = await f.read(CHUNK_SIZE)
+    if chunk_data is None:
+        async with aiofiles.open(local_path, "rb") as f:
+            await f.seek(part_num * CHUNK_SIZE)
+            chunk_data = await f.read(CHUNK_SIZE)
     if not chunk_data:
         raise Exception(f"Parte vazia {part_num}")
 
@@ -609,20 +616,18 @@ async def _readahead_producer(local_path, total_parts, queue, worker_id):
     this producer is already reading chunk N+1 into memory.  The queue
     bounds memory usage to ``queue.maxsize * CHUNK_SIZE`` bytes.
     """
-    for part_num in range(total_parts):
-        chunk_name_placeholder = part_num  # actual name built by caller
-        async with aiofiles.open(local_path, "rb") as f:
-            await f.seek(part_num * CHUNK_SIZE)
+    async with aiofiles.open(local_path, "rb") as f:
+        for part_num in range(total_parts):
             chunk_data = await f.read(CHUNK_SIZE)
-        if not chunk_data:
-            break
-        await queue.put((part_num, chunk_data))
+            if not chunk_data:
+                break
+            await queue.put((part_num, chunk_data))
     # Signal end-of-stream
     await queue.put(None)
     logger.debug(f"[W{worker_id}] Read-ahead: all {total_parts} chunks queued")
 
 async def upload_worker(bot, target_chat_id, mongo, worker_id, bot_index=0):
-    logger.info(f"👷 Worker #{worker_id} Pronto (bot #{bot_index + 1})")
+    logger.debug(f"👷 Worker #{worker_id} Pronto (bot #{bot_index + 1})")
     
     while True:
         try: task = await asyncio.wait_for(UPLOAD_QUEUE.get(), timeout=2.0)
@@ -723,7 +728,7 @@ async def upload_worker(bot, target_chat_id, mongo, worker_id, bot_index=0):
                         uploaded_bytes += len(chunk_data)
                         part_num += 1
                         percent = uploaded_bytes / real_size * 100
-                        logger.info(
+                        logger.debug(
                             f"[W{worker_id}] Progresso: {filename} parte={part_num}/{total_parts} "
                             f"percentual={percent:.1f}% enviado={uploaded_bytes/1024/1024:.2f}/{real_size/1024/1024:.2f} MB"
                         )
@@ -777,7 +782,7 @@ async def upload_worker_parallel(bots, target_chat_id, mongo, worker_id):
     doesn't block the entire batch.  A read-ahead producer overlaps disk
     I/O with network I/O by pre-filling an async queue of chunks.
     """
-    logger.info(f"Worker #{worker_id} pronto (bots={len(bots)}, partes={PART_WORKERS_PER_FILE})")
+    logger.debug(f"Worker #{worker_id} pronto (bots={len(bots)}, partes={PART_WORKERS_PER_FILE})")
     while True:
         try:
             task = await asyncio.wait_for(UPLOAD_QUEUE.get(), timeout=2.0)
@@ -827,7 +832,7 @@ async def upload_worker_parallel(bots, target_chat_id, mongo, worker_id):
 
             # --- Read-ahead: start producer that fills a bounded queue ---
             readahead_queue: asyncio.Queue = asyncio.Queue(
-                maxsize=PART_WORKERS_PER_FILE * 2
+                maxsize=PART_WORKERS_PER_FILE
             )
             producer_task = asyncio.create_task(
                 _readahead_producer(local_path, total_parts, readahead_queue, worker_id)
@@ -849,8 +854,9 @@ async def upload_worker_parallel(bots, target_chat_id, mongo, worker_id):
                 # Upload each part in the batch — bot rotation happens
                 # inside upload_part_with_retries via the bots[] list.
                 async def _upload_one(pn: int) -> dict:
+                    chunk_data = chunk_map.get(pn)
                     return await upload_part_with_retries(
-                        worker_id, bots, target_chat_id, local_path, file_uuid, pn
+                        worker_id, bots, target_chat_id, local_path, file_uuid, pn, chunk_data
                     )
 
                 results = await asyncio.gather(
@@ -864,7 +870,7 @@ async def upload_worker_parallel(bots, target_chat_id, mongo, worker_id):
                     {"_id": file_doc["_id"]},
                     {"$set": {"uploaded_bytes": uploaded_bytes, "parts": parts_metadata}}
                 )
-                logger.info(
+                logger.debug(
                     f"[W{worker_id}] Progresso: {filename} parte={batch_end}/{total_parts} "
                     f"percentual={percent:.1f}% enviado={uploaded_bytes/1024/1024:.2f}/{real_size/1024/1024:.2f} MB"
                 )
@@ -946,7 +952,7 @@ async def http_write_json(writer, data, status=200):
 
 async def list_completed_files(mongo, query, limit):
     limit = min(max(int(limit or 100), 1), 500)
-    criteria = {"type": "file", "status": "completed", "parts.0": {"$exists": True}}
+    criteria: dict[str, Any] = {"type": "file", "status": "completed", "parts.0": {"$exists": True}}
     if query:
         rx = re.compile(re.escape(query), re.IGNORECASE)
         criteria["$or"] = [{"name": rx}, {"parent": rx}]
@@ -1066,7 +1072,10 @@ async def handle_http_client(reader, writer, mongo, bots):
         else:
             await http_index(writer, mongo, params.get("q", [""])[0])
     except Exception as exc:
-        logger.warning("HTTP stream erro: %s", exc)
+        if isinstance(exc, (ConnectionResetError, BrokenPipeError, asyncio.IncompleteReadError)):
+            logger.debug("HTTP stream desconectado: %s", exc)
+        else:
+            logger.warning("HTTP stream erro: %s", exc)
         with contextlib.suppress(Exception):
             writer.write(http_headers(500, "text/plain; charset=utf-8", b"erro interno"))
             await writer.drain()
