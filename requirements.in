@@ -6,7 +6,7 @@ cryptography
 dnspython
 motor
 pyftpdlib
-pyrogram
+pyrofork
 pymongo
 python-dotenv
 aiofiles

@@ -5,7 +5,7 @@
 ### **Transforme o Telegram em seu Armazenamento Ilimitado**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Python 3.10+](https://img.shields.io/badge/Python-3.10+-green.svg)](https://www.python.org)
+[![Python 3.14](https://img.shields.io/badge/Python-3.14-green.svg)](https://www.python.org)
 [![Docker](https://img.shields.io/badge/Docker-Ready-blue.svg)](https://docker.com)
 
 📖 [Documentação](docs/INSTALLATION.md) • 🚀 [Início Rápido](docs/INSTALLATION.md) • 🔐 [TLS / FTPS](docs/SECURITY.md) • 🐛 [Issues](https://github.com/samucamg/NebulaFTP/issues)
@@ -254,8 +254,8 @@ LOG_LEVEL=INFO # DEBUG, INFO, WARNING, ERROR
 
 ### Tecnologias
 
-- **Python 3.10+** - Linguagem principal
-- **Pyrogram** - Cliente MTProto (rápido)
+- **Python 3.14** - Linguagem principal
+- **Pyrofork** - Cliente MTProto mantido e compatível com Python 3.14
 - **pyftpdlib** - Servidor FTP assíncrono
 - **Motor** - Driver MongoDB assíncrono
 - **aiofiles** - I/O assíncrono de arquivos

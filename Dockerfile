@@ -1,5 +1,5 @@
 # Multi-stage build keeps the runtime image lean (no gcc, no headers).
-FROM python:3.12-slim-bookworm AS builder
+FROM python:3.14-slim-bookworm AS builder
 
 ENV PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
@@ -17,7 +17,7 @@ COPY requirements.txt .
 RUN pip install --prefix=/install --no-cache-dir -r requirements.txt
 
 
-FROM python:3.12-slim-bookworm AS runtime
+FROM python:3.14-slim-bookworm AS runtime
 
 # tini provides proper PID-1 / signal handling for graceful shutdown.
 RUN apt-get update \
@@ -27,7 +27,7 @@ RUN apt-get update \
     && useradd --system --uid 10001 --gid nebula --home /app --shell /sbin/nologin nebula
 
 ENV PATH="/install/bin:${PATH}" \
-    PYTHONPATH="/install/lib/python3.12/site-packages" \
+    PYTHONPATH="/install/lib/python3.14/site-packages" \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PYTHONUNBUFFERED=1 \

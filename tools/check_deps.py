@@ -9,8 +9,7 @@ Estratégia:
 
 1. Para cada módulo do `RUNTIME_REQUIRED`, tenta ``importlib.util.find_spec``
    e ``importlib.import_module`` (este último em subprocess explícito
-   quando há risco conhecido de side-effect top-level, ex.: ``pyrogram``
-   que chama ``asyncio.get_event_loop()`` em Py 3.14 e rebenta).
+   quando há risco conhecido de side-effect top-level.
 2. Se o pacote está ausente ou o import falha, despacha um subprocess
    ``sys.executable -m pip install --quiet --disable-pip-version-check``
    para a faixa de versões de ``requirements.txt``.
@@ -46,11 +45,8 @@ RUNTIME_REQUIRED: tuple[tuple[str, str], ...] = (
     ("motor", "motor"),
     # ``aiohttp`` top-level é seguro.
     ("aiohttp", "aiohttp"),
-    # ``pyrogram`` em Py 3.14 falha em ``asyncio.get_event_loop`` no
-    # import-time. Importamos em subprocess para detetar, mas o
-    # ``main.py`` continua a ter o patch ``asyncio.set_event_loop`` que
-    # torna o uso real seguro.
-    ("pyrogram", "pyrogram"),
+    # Pyrofork keeps the public ``pyrogram`` namespace.
+    ("pyrogram", "pyrofork"),
     ("tgcrypto", "tgcrypto"),
     ("pyaes", "pyaes"),
     # PySocks distribui como ``pysocks`` mas expõe ``import socks``;
@@ -58,6 +54,8 @@ RUNTIME_REQUIRED: tuple[tuple[str, str], ...] = (
     # para casar com `_read_pinned_specs`.
     ("socks", "pysocks"),
     ("pyftpdlib", "pyftpdlib"),
+    ("PIL", "Pillow"),
+    ("pystray", "pystray"),
 )
 
 
@@ -96,11 +94,7 @@ def _probe(module_name: str) -> tuple[bool, str | None]:
             return False, "find_spec returned None"
     except (ImportError, ValueError) as exc:
         return False, f"find_spec failed: {exc}"
-    # Confirma import real (alguns meta-path finders mentem). Mas
-    # saltamos o import real para pyrogram/motor em Py 3.14 porque
-    # dispara RuntimeError; o find_spec é suficiente.
-    if module_name in {"pyrogram"} and sys.version_info >= (3, 14):
-        return True, None
+    # Confirma import real (alguns meta-path finders mentem).
     try:
         importlib.import_module(module_name)
     except Exception as exc:  # noqa: BLE001 - queremos qualquer falha

@@ -6,6 +6,7 @@ import importlib.util
 import os
 import sys
 from pathlib import PurePosixPath
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -147,6 +148,71 @@ def test_resolve_part_bot_uses_stored_bot_index():
     assert pathio.resolve_part_bot({}, bots) == "bot1"
 
 
+def test_resolve_part_bots_includes_legacy_shift_fallback():
+    bots = ["materializer", "bot1", "bot2"]
+    assert set(pathio.resolve_part_bots({"bot_index": 0}, bots)) == set(bots)
+
+
+def test_resolve_part_bots_tries_stored_bot_first():
+    bots = ["materializer", "bot1", "bot2"]
+    assert pathio.resolve_part_bots({"bot_index": 2}, bots)[0] == "bot2"
+
+
+def test_resolve_part_bot_prefers_named_bot():
+    class Bot:
+        def __init__(self, name):
+            self.name = name
+
+    bots = [Bot("materializer"), Bot("bot1"), Bot("bot2")]
+    assert pathio.resolve_part_bot({"bot_index": 0, "bot_name": "bot2"}, bots).name == "bot2"
+    assert pathio.resolve_part_bots({"bot_index": 0, "bot_name": "bot2"}, bots)[0].name == "bot2"
+
+
+@pytest.mark.asyncio
+async def test_stream_marks_bot_busy_and_persists_verified_route(monkeypatch):
+    class Bot:
+        name = "bot1"
+        _nebula_streams = 0
+
+    bot = Bot()
+
+    class FakeFile:
+        reference_refreshed = False
+        file_id = "file1"
+
+        def __init__(self, _file_id, client, **_kwargs):
+            self.client = client
+
+        async def stream(self, offset=0):
+            assert offset == 0
+            assert self.client._nebula_streams == 1
+            yield b"data"
+
+    monkeypatch.setattr(pathio, "File", FakeFile)
+    db = type("DB", (), {"files": type("Files", (), {"update_one": AsyncMock()})()})()
+    node = pathio.Node(
+        type="file",
+        name="movie.mkv",
+        size=4,
+        _id="media1",
+        parts=[{
+            "part_id": 0,
+            "file_size": 4,
+            "tg_file": "file1",
+            "tg_message": 1,
+            "bot_index": 0,
+            "bot_name": "old-bot",
+        }],
+    )
+    reader = pathio.MongoDBMemoryIO(node, "rb", [bot], db)
+
+    assert [chunk async for chunk in reader.iter_by_block(4)] == [b"data"]
+    assert bot._nebula_streams == 0
+    updates = db.files.update_one.await_args.args[1]["$set"]
+    assert updates["parts.$.bot_name"] == "bot1"
+    assert updates["stream_bot_name"] == "bot1"
+
+
 def test_tls_knob_documented_in_env_example():
     path = os.path.join(ROOT, ".env.example")
     with open(path, encoding="utf-8") as fh:
@@ -161,7 +227,7 @@ def test_dockerfile_no_longer_runs_as_root_and_uses_tini():
     assert "USER nebula" in body
     assert "tini" in body.lower()
     assert "HEALTHCHECK" in body
-    assert "3.12" in body
+    assert "3.14" in body
 
 
 def test_compose_dropped_host_network_and_adds_healthchecks():
@@ -230,20 +296,18 @@ ftp_range = _load("range")
         ("bytes=200-",        1024, (200, 1023, 206)),  # open-ended
         ("bytes=-2000",       1024, (0, 1023, 206)),    # suffix >= size -> whole file
         ("bytes=0-0",         1024, (0, 0, 206)),
-        ("bytes=1024-1024",   1024, (1024, 1023, 206)), # boundary clamp: end pinned to size-1
+        ("bytes=1024-1024",   1024, (0, 1023, 416)),
         ("",                  1024, (0, 1023, 200)),    # missing header
         (None,                1024, (0, 1023, 200)),    # caller passed None
         ("garbage",           1024, (0, 1023, 200)),    # not a Range header
         ("bytes=abc-def",     1024, (0, 1023, 200)),    # unparsable -> safe fallback
-        # Range past EOF: clamped to last byte. This matches the
-        # current implementation; emitting 416 would be the RFC-7233 §4.4
-        # alternative and is tracked as a manual-only decision.
-        ("bytes=2000-3000",   1024, (2000, 1023, 206)),
+        # Unsatisfiable ranges return 416.
+        ("bytes=2000-3000",   1024, (0, 1023, 416)),
     ],
     ids=[
         "closed", "suffix", "open-ended", "suffix-oversize", "single-byte",
-        "boundary-clamp", "empty-header", "none-header", "garbage",
-        "unparseable", "past-eof-clamp",
+        "boundary-416", "empty-header", "none-header", "garbage",
+        "unparseable", "past-eof-416",
     ],
 )
 def test_parse_range_returns_expected_window(header, size, expected):

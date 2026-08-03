@@ -11,8 +11,8 @@ if errorlevel 1 (
 )
 
 echo.
-set /p MONITOR_PATHS="Digite uma ou mais pastas para monitorar separadas por ; (ex: E:\;D:\Videos) [Padrao: E:\]: "
-if "%MONITOR_PATHS%"=="" set MONITOR_PATHS=E:\
+set /p MONITOR_PATHS="Digite uma ou mais pastas para monitorar separadas por ; (ex: E:\;D:\Videos) [Padrao: D:/midias]: "
+if "%MONITOR_PATHS%"=="" set MONITOR_PATHS=D:/midias
 
 :: Corrige o escape de barra invertida antes de aspas duplas ao passar para o Python
 if "%MONITOR_PATHS:~-1%"=="\" set "MONITOR_PATHS=%MONITOR_PATHS%\"
@@ -26,6 +26,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "Star
 
 echo.
 echo Starting monitor and feeder for %MONITOR_PATHS%...
-python .\tools\feed_ftp.py --source "%MONITOR_PATHS%" --direct-mongo --workers 2 --watch --max-active 60 --poll-seconds 60 --delete-source
+python .\tools\feed_ftp.py --source "%MONITOR_PATHS%" --direct-mongo --workers 2 --watch --max-active 60 --poll-seconds 60 --delete-source --prune-completed-strm
 
 pause

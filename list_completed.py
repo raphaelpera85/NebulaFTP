@@ -18,9 +18,10 @@ if os.path.exists(".env"):
 
 mongo_uri = os.getenv("MONGODB", "mongodb://localhost:27017")
 client = MongoClient(mongo_uri)
-db = client.ftp
+db = client[os.getenv("MONGO_DATABASE", "ftp")]
 
 completed_files = list(db.files.find({'type': 'file', 'status': 'completed'}))
+library_user = os.getenv("NEBULA_LIBRARY_USER", "raphael")
 
 series_data = []
 filmes_data = []
@@ -36,7 +37,7 @@ for doc in completed_files:
     # Remove o primeiro elemento se for '/' e o segundo se for o nome do usuário (ex: raphael)
     if parts and parts[0] == "/":
         parts.pop(0)
-    if parts and parts[0] == "raphael":
+    if parts and parts[0] == library_user:
         parts.pop(0)
         
     # Identifica se é Série ou Filme

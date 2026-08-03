@@ -1,12 +1,14 @@
 import logging
 import os
 import re
+import shutil
 import unicodedata
 from asyncio import CancelledError, Lock, gather, get_event_loop
 from asyncio import sleep as asleep
 from collections import OrderedDict, namedtuple
 from functools import wraps
 from io import BytesIO
+from itertools import count
 from os import environ
 from pathlib import PurePosixPath
 from sys import exc_info
@@ -43,13 +45,25 @@ except (ImportError, RuntimeError, OSError):
     File = None  # type: ignore[assignment,misc]
 
 logger = logging.getLogger("NebulaFTP")
+STREAM_BOT_CURSOR = count()
 
 __all__ = (
     "AbstractPathIO", "PathIONursery", "MongoDBPathIO", "BoundedLRUCache",
-    "is_uploadable_name", "movie_folder_score", "resolve_part_bot",
+    "is_uploadable_name", "movie_folder_score", "resolve_part_bot", "resolve_part_bots",
 )
 
-CACHE_DIR = "staging"
+CACHE_DIRS = [
+    os.path.abspath(path.strip())
+    for path in environ.get("STAGING_DIRS", environ.get("STAGING_DIR", "staging")).split(";")
+    if path.strip()
+]
+CACHE_DIR = max(
+    CACHE_DIRS,
+    key=lambda path: (
+        shutil.disk_usage(os.path.dirname(path) or path).free
+        / shutil.disk_usage(os.path.dirname(path) or path).total
+    ),
+)
 UPLOADABLE_EXTENSIONS = {
     ".mkv", ".mp4", ".avi", ".mov", ".wmv", ".m4v",
     ".sub", ".ass", ".ssa", ".vtt",
@@ -58,9 +72,11 @@ MOVIE_TOKEN_NOISE = {
     "aac", "ac3", "amzn", "bluray", "brrip", "com", "dual", "fgt", "galaxyrg",
     "h264", "h265", "hdr", "imax", "lapumia", "rip", "web", "webdl", "webrip",
     "www", "x264", "x265", "yify", "yts",
+    "de", "da", "do", "das", "dos", "em", "um", "uma", "os", "as", "na", "no", "nas", "nos",
+    "por", "para", "com", "sem", "the", "of", "and", "in", "on", "at", "to", "for", "with",
 }
-if not os.path.exists(CACHE_DIR):
-    os.makedirs(CACHE_DIR)
+for cache_dir in CACHE_DIRS:
+    os.makedirs(cache_dir, exist_ok=True)
 
 
 def is_uploadable_name(name):
@@ -83,13 +99,16 @@ def movie_folder_score(filename, foldername):
     folder_tokens = movie_tokens(foldername)
     if not file_tokens or not folder_tokens:
         return 0.0
-    common = file_tokens & folder_tokens
-    non_year_common = {t for t in common if not re.fullmatch(r"(19|20)\d{2}", t)}
-    if not non_year_common:
-        return 0.0
-    score = len(common) / min(len(file_tokens), len(folder_tokens))
     file_years = {t for t in file_tokens if re.fullmatch(r"(19|20)\d{2}", t)}
     folder_years = {t for t in folder_tokens if re.fullmatch(r"(19|20)\d{2}", t)}
+    file_title = file_tokens - file_years
+    folder_title = folder_tokens - folder_years
+    if not file_title or not folder_title:
+        return 0.0
+    common_title = file_title & folder_title
+    if not common_title:
+        return 0.0
+    score = len(common_title) / min(len(file_title), len(folder_title))
     if file_years and folder_years:
         score += 0.25 if file_years & folder_years else -0.50
     return score
@@ -99,8 +118,33 @@ def resolve_part_bot(part, tg):
     if isinstance(tg, (list, tuple)):
         if not tg:
             return None
+        bot_name = part.get("bot_name")
+        if bot_name:
+            for bot in tg:
+                if getattr(bot, "name", None) == bot_name:
+                    return bot
         return tg[part.get("bot_index", 0) % len(tg)]
     return tg
+
+
+def resolve_part_bots(part, tg):
+    if not isinstance(tg, (list, tuple)):
+        return [tg] if tg is not None else []
+    if not tg:
+        return []
+    bot_name = part.get("bot_name")
+    if bot_name:
+        for idx, bot in enumerate(tg):
+            if getattr(bot, "name", None) == bot_name:
+                start = next(STREAM_BOT_CURSOR) % len(tg)
+                rotated = [*tg[start:], *tg[:start]]
+                candidates = [tg[idx], tg[(idx + 1) % len(tg)], *rotated]
+                return list(dict.fromkeys(candidates))
+    index = part.get("bot_index", 0) % len(tg)
+    start = next(STREAM_BOT_CURSOR) % len(tg)
+    rotated = [*tg[start:], *tg[:start]]
+    candidates = [tg[index], tg[(index + 1) % len(tg)], *rotated]
+    return list(dict.fromkeys(candidates))
 
 
 class BoundedLRUCache(OrderedDict):
@@ -166,13 +210,18 @@ class Node:
         self.path = str(PurePosixPath(parent) / name)
         self.parts = parts
         self.local_path = local_path
+        self.id = k.get("_id")
 
 class MongoDBMemoryIO:
     def __init__(self, node, mode, tg, db):
         self._node = node; self._mode = mode; self._tg = tg; self._db = db
         self.offset = 0
         self.safe_name = f"{uuid4().hex}_{node.name}"
-        self.local_path = os.path.join(CACHE_DIR, self.safe_name)
+        cache_dir = max(
+            CACHE_DIRS,
+            key=lambda path: shutil.disk_usage(path).free / shutil.disk_usage(path).total,
+        )
+        self.local_path = os.path.join(cache_dir, self.safe_name)
 
     async def __aenter__(self): return self
     async def __aexit__(self, *args, **kwargs): pass
@@ -258,12 +307,85 @@ class MongoDBMemoryIO:
             part_end = current_file_pos + part_size
             if part_end <= start_read_at: current_file_pos += part_size; continue
             local_offset = max(0, start_read_at - current_file_pos)
-            tg = resolve_part_bot(part, self._tg)
-            if tg is None:
+            candidates = resolve_part_bots(part, self._tg)
+            if not candidates:
                 logger.error("Cannot stream from Telegram: no bot clients configured")
                 return
-            file = File(part["tg_file"], tg)
-            async for chunk in file.stream(offset=local_offset): yield chunk
+            streamed = False
+            for tg in candidates:
+                bot_number = self._tg.index(tg) + 1 if isinstance(self._tg, (list, tuple)) else 1
+                logger.info(
+                    "[STREAM] Midia=%s parte=%s tentando Bot #%s",
+                    self._node.name,
+                    part.get("part_id"),
+                    bot_number,
+                )
+                file = File(
+                    part["tg_file"],
+                    tg,
+                    chat_id=os.environ.get("CHAT_ID"),
+                    message_id=part.get("tg_message"),
+                )
+                active_streams = getattr(tg, "_nebula_streams", 0)
+                if not isinstance(active_streams, int):
+                    active_streams = 0
+                setattr(tg, "_nebula_streams", active_streams + 1)
+                try:
+                    async for chunk in file.stream(offset=local_offset):
+                        if not streamed:
+                            bot_name = getattr(tg, "name", None)
+                            bot_changed = (
+                                part.get("bot_index") != bot_number - 1
+                                or (bot_name and part.get("bot_name") != bot_name)
+                            )
+                            if self._node.id and (bot_changed or file.reference_refreshed):
+                                try:
+                                    updates = {
+                                        "parts.$.bot_index": bot_number - 1,
+                                        "parts.$.bot_name": bot_name,
+                                        "parts.$.stream_verified_at": int(time()),
+                                        "stream_bot_name": bot_name,
+                                    }
+                                    if file.reference_refreshed:
+                                        updates["parts.$.tg_file"] = file.file_id
+                                        updates["parts.$.reference_updated_at"] = int(time())
+                                    await self._db.files.update_one(
+                                        {"_id": self._node.id, "parts.part_id": part.get("part_id")},
+                                        {"$set": updates},
+                                    )
+                                    part["bot_index"] = bot_number - 1
+                                    part["bot_name"] = bot_name
+                                    if file.reference_refreshed:
+                                        part["tg_file"] = file.file_id
+                                    logger.info(
+                                        "[STREAM] Rota salva: midia=%s parte=%s Bot #%s",
+                                        self._node.name,
+                                        part.get("part_id"),
+                                        bot_number,
+                                    )
+                                except Exception as exc:
+                                    logger.warning("[STREAM] Nao foi possivel salvar referencia: %s", exc)
+                            logger.info(
+                                "[STREAM] Midia=%s parte=%s atendida pelo Bot #%s",
+                                self._node.name,
+                                part.get("part_id"),
+                                bot_number,
+                            )
+                        streamed = True
+                        yield chunk
+                finally:
+                    setattr(tg, "_nebula_streams", max(0, getattr(tg, "_nebula_streams", 1) - 1))
+                if streamed:
+                    break
+                logger.warning(
+                    "[STREAM] Midia=%s parte=%s sem dados no Bot #%s",
+                    self._node.name,
+                    part.get("part_id"),
+                    bot_number,
+                )
+            if not streamed:
+                logger.error("Cannot stream Telegram part %s with configured bot indexes", part.get("part_id"))
+                return
             current_file_pos += part_size; start_read_at = current_file_pos
 
 class MongoDBPathIO(AbstractPathIO):
@@ -379,7 +501,7 @@ class MongoDBPathIO(AbstractPathIO):
         # Escape any regex metacharacters in the path so sibling trees
         # whose names happen to share a prefix (e.g. /Foo vs /FooBar)
         # are not also wiped out.
-        await self._files.delete_many({"parent": {"$regex": f"^{re.escape(full)}"}})
+        await self._files.delete_many({"parent": {"$regex": f"^{re.escape(full)}(?:/|$)"}})
 
     @universal_exception
     async def unlink(self, path):

@@ -15,14 +15,18 @@ except RuntimeError as exc:
     raise SystemExit(f"[deps] {exc}") from None
 
 import contextlib
+import hmac
 import io
+import ipaddress
 import json
 import logging
 import mimetypes
 import os
 import re
+import shutil
 import signal
 import ssl
+import subprocess
 import sys
 import time
 import uuid
@@ -31,6 +35,7 @@ from html import escape
 from logging.handlers import RotatingFileHandler
 from os import environ
 from os.path import exists
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, urlsplit
 
@@ -38,19 +43,24 @@ import aiofiles
 from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument
+from pymongo.errors import DuplicateKeyError
 from pyrogram import Client
 from pyrogram import utils as pyrogram_utils
 from pyrogram.errors import FloodWait, RPCError
 
+from control_plane import ControlPlane, FeederSupervisor, validate_ftp_security
 from ftp import MongoDBPathIO, MongoDBUserManager, Server
 from ftp.common import UPLOAD_QUEUE
 from ftp.pathio import MongoDBMemoryIO, Node, is_uploadable_name, movie_folder_score
+from ftp.range import parse_range as _parse_range
+from ftp.tg import install_reliable_upload, send_document_bot_api
 
 for stream in (sys.stdout, sys.stderr):
     if hasattr(stream, "reconfigure"):
         stream.reconfigure(encoding="utf-8", errors="replace")
 
 pyrogram_utils.MIN_CHANNEL_ID = min(pyrogram_utils.MIN_CHANNEL_ID, -1009999999999)  # type: ignore
+install_reliable_upload()
 
 if exists(".env"):
     from dotenv import load_dotenv
@@ -60,18 +70,146 @@ if exists(".env"):
 LOG_LEVEL = environ.get("LOG_LEVEL", "INFO")
 LOG_COMPACT_LINES = int(environ.get("LOG_COMPACT_LINES", 1000))
 LOG_CONTEXT_FILE = environ.get("LOG_CONTEXT_FILE", "nebula_context.md")
+LOG_MAX_SIZE = max(1, int(environ.get("LOG_MAX_SIZE", 5)))
+LOG_BACKUP_COUNT = max(0, int(environ.get("LOG_BACKUP_COUNT", 3)))
 CHUNK_SIZE_MB = int(environ.get("CHUNK_SIZE_MB", 64))
 CHUNK_SIZE = CHUNK_SIZE_MB * 1024 * 1024 
 MAX_RETRIES = int(environ.get("MAX_RETRIES", 5))
 MAX_STAGING_AGE = int(environ.get("MAX_STAGING_AGE", 3600))
 MAX_WORKERS = int(environ.get("MAX_WORKERS", 4))
 PART_WORKERS_PER_FILE = max(1, int(environ.get("PART_WORKERS_PER_FILE", 2)))
+UPLOAD_CONCURRENCY = max(1, int(environ.get("UPLOAD_CONCURRENCY", 8)))
+STREAM_ONLY = environ.get("STREAM_ONLY", "false").lower() in ("1", "true", "yes")
 UPLOAD_STATUS_MESSAGES = environ.get("UPLOAD_STATUS_MESSAGES", "false").lower() in ("1", "true", "yes")
 STREAM_HOST = environ.get("STREAM_HOST", "127.0.0.1")
 STREAM_PORT = int(environ.get("STREAM_PORT", 2122))
+STREAM_TOKEN = environ.get("STREAM_TOKEN", "")
+TRANSCODE_CONCURRENCY = max(1, int(environ.get("TRANSCODE_CONCURRENCY", 2)))
+_TRANSCODE_SEMAPHORE = None
+_TRANSCODE_SEMAPHORE_LOOP = None
+STAGING_DIRS = [
+    os.path.abspath(path.strip())
+    for path in environ.get("STAGING_DIRS", environ.get("STAGING_DIR", "staging")).split(";")
+    if path.strip()
+]
+_UPLOAD_SEMAPHORE = None
+_UPLOAD_SEMAPHORE_LOOP = None
+
+
+def get_upload_semaphore():
+    global _UPLOAD_SEMAPHORE, _UPLOAD_SEMAPHORE_LOOP
+    loop = asyncio.get_running_loop()
+    if _UPLOAD_SEMAPHORE is None or _UPLOAD_SEMAPHORE_LOOP is not loop:
+        _UPLOAD_SEMAPHORE = asyncio.Semaphore(UPLOAD_CONCURRENCY)
+        _UPLOAD_SEMAPHORE_LOOP = loop
+    return _UPLOAD_SEMAPHORE
+
+
+def get_transcode_semaphore():
+    global _TRANSCODE_SEMAPHORE, _TRANSCODE_SEMAPHORE_LOOP
+    loop = asyncio.get_running_loop()
+    if _TRANSCODE_SEMAPHORE is None or _TRANSCODE_SEMAPHORE_LOOP is not loop:
+        _TRANSCODE_SEMAPHORE = asyncio.Semaphore(TRANSCODE_CONCURRENCY)
+        _TRANSCODE_SEMAPHORE_LOOP = loop
+    return _TRANSCODE_SEMAPHORE
+
+
+def is_loopback_host(host):
+    if host.casefold() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def get_upload_worker_count(bot_count):
+    return min(MAX_WORKERS, UPLOAD_CONCURRENCY, max(0, int(bot_count)))
+
+
+def get_contiguous_uploaded_parts(parts, total_parts=None):
+    by_id = {part.get("part_id"): part for part in parts or []}
+    if total_parts is None:
+        total_parts = max(by_id, default=-1) + 1
+    completed = []
+    for part_id in range(total_parts):
+        part = by_id.get(part_id)
+        if not part or not part.get("tg_file") or int(part.get("file_size") or 0) <= 0:
+            break
+        completed.append(part)
+    return completed
+
+
+async def _wait_for_streaming(bot):
+    active_streams = getattr(bot, "_nebula_streams", 0)
+    while isinstance(active_streams, int) and active_streams > 0:
+        await asyncio.sleep(0.1)
+        active_streams = getattr(bot, "_nebula_streams", 0)
+
+
+async def _wait_until_streaming(bot):
+    while not isinstance(getattr(bot, "_nebula_streams", 0), int) or getattr(
+        bot, "_nebula_streams", 0
+    ) <= 0:
+        await asyncio.sleep(0.1)
+
+
+async def _send_part_document(
+    bot,
+    target_chat_id,
+    chunk_data,
+    chunk_name,
+    preemption_state,
+):
+    token = getattr(bot, "_nebula_bot_token", None)
+    if not isinstance(token, str) or not token:
+        return await bot.send_document(
+            chat_id=target_chat_id,
+            document=io.BytesIO(chunk_data),
+            file_name=chunk_name,
+            force_document=True,
+            caption="",
+            progress=_stop_upload_for_streaming,
+            progress_args=(bot, preemption_state),
+        )
+
+    upload_task = asyncio.create_task(
+        send_document_bot_api(
+            bot,
+            target_chat_id,
+            chunk_data,
+            chunk_name,
+        )
+    )
+    stream_task = asyncio.create_task(_wait_until_streaming(bot))
+    try:
+        done, _ = await asyncio.wait(
+            {upload_task, stream_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if upload_task in done:
+            return await upload_task
+        preemption_state["preempted"] = True
+        upload_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await upload_task
+        return None
+    finally:
+        stream_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await stream_task
+
+
+async def _stop_upload_for_streaming(_current, _total, bot, state):
+    active_streams = getattr(bot, "_nebula_streams", 0)
+    if isinstance(active_streams, int) and active_streams > 0:
+        state["preempted"] = True
+        bot.stop_transmission()
+
 
 # Portas Passivas
 PASSIVE_PORTS = None
+PASSIVE_PORTS_ERROR = None
 pp_str = environ.get("PASSIVE_PORTS")
 if pp_str and "-" in pp_str:
     try:
@@ -80,32 +218,68 @@ if pp_str and "-" in pp_str:
             raise ValueError(f"invalid passive port range: {pp_str}")
         PASSIVE_PORTS = range(start_p, end_p + 1)
     except (ValueError, TypeError) as exc:
-        logger.warning("PASSIVE_PORTS parse failed (%s); using ephemeral range", exc)
-        PASSIVE_PORTS = range(60000, 60100)
+        PASSIVE_PORTS_ERROR = str(exc)
 
 # TLS / FTPS (RFC 4217)
 TLS_CERTFILE = environ.get("TLS_CERTFILE")
 TLS_KEYFILE = environ.get("TLS_KEYFILE")
 TLS_REQUIRE_CLIENT_CERT = environ.get("TLS_REQUIRE_CLIENT_CERT", "false").lower() in ("1", "true", "yes")
+TLS_REQUIRED = environ.get("TLS_REQUIRED", "false").lower() in ("1", "true", "yes")
+FTP_SECURITY_MODE = environ.get("FTP_SECURITY_MODE") or (
+    "ftps-explicit" if TLS_CERTFILE and TLS_KEYFILE else "ftp"
+)
+CONTROL_ENABLED = environ.get("CONTROL_ENABLED", "false").lower() in ("1", "true", "yes")
+CONTROL_HOST = environ.get("CONTROL_HOST", "127.0.0.1")
+CONTROL_PORT = int(environ.get("CONTROL_PORT", 2130))
+CONTROL_DRAIN_TIMEOUT = max(1, int(environ.get("CONTROL_DRAIN_TIMEOUT", 300)))
+PRUNE_PREVIEW_TTL = max(30, int(environ.get("PRUNE_PREVIEW_TTL", 300)))
+
+
+def configured_paths(name, fallback=""):
+    return tuple(
+        Path(path.strip()).expanduser().resolve()
+        for path in environ.get(name, fallback).split(";")
+        if path.strip()
+    )
+
+
+FEED_ALLOWED_ROOTS = configured_paths("FEED_ALLOWED_ROOTS")
+FEED_ALLOWED_DESTINATIONS = configured_paths("FEED_ALLOWED_DESTINATIONS")
+STRM_OUTPUT_ROOTS = configured_paths(
+    "STRM_OUTPUT_ROOTS",
+    environ.get("STRM_OUTPUT_DIR", str(Path(__file__).resolve().parent / "strm_library")),
+)
+FEED_STATE_DIR = Path(
+    environ.get("FEED_STATE_DIR", str(Path(__file__).resolve().parent / ".nebula_state"))
+).resolve()
+FEED_STOP_TIMEOUT = max(1, int(environ.get("FEED_STOP_TIMEOUT", 15)))
 
 # --- CONTROLE DE LOCKS (PROTEÇÃO) ---
 # Conjunto para armazenar caminhos de arquivos que estão sendo enviados agora.
 # O Garbage Collector NÃO pode tocar nestes arquivos.
 ACTIVE_UPLOADS = set()
 
+
+def is_staging_path(path):
+    try:
+        target = os.path.abspath(path)
+    except (TypeError, ValueError):
+        return False
+    for root in STAGING_DIRS:
+        try:
+            if os.path.commonpath([root, target]) == root:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
 def safe_remove_staging_file(path, force_delete=False):
     try:
-        root = os.path.abspath("staging")
         target = os.path.abspath(path)
-        try:
-            in_staging = os.path.commonpath([root, target]) == root
-        except ValueError:
-            in_staging = False
-        
-        # Permite deleção global fora do staging se configurado no .env
-        global_delete = os.environ.get("DELETE_SOURCE_AFTER_UPLOAD", "false").lower() in ("1", "true", "yes")
+        in_staging = is_staging_path(target)
 
-        if not in_staging and not force_delete and not global_delete:
+        if not in_staging and not force_delete:
             logger.debug("source cleanup skipped outside staging: %s", path)
             return
         os.remove(target)
@@ -179,8 +353,8 @@ log_handler = CompactingFileHandler(
     'nebula.log',
     compact_lines=LOG_COMPACT_LINES,
     context_file=LOG_CONTEXT_FILE,
-    maxBytes=5*1024*1024,
-    backupCount=2,
+    maxBytes=LOG_MAX_SIZE*1024*1024,
+    backupCount=LOG_BACKUP_COUNT,
     encoding="utf-8",
     errors="replace",
 )
@@ -264,7 +438,8 @@ async def resolve_media_parent(mongo, parent, filename):
         return parent
 
     parts = parent.strip("/").split("/")
-    user_root = f"/{parts[0]}" if parts and parts[0] else "/raphael"
+    default_user_root = f"/{environ.get('NEBULA_LIBRARY_USER', 'raphael')}"
+    user_root = f"/{parts[0]}" if parts and parts[0] else default_user_root
     if "Series" in parts:
         return parent
 
@@ -326,7 +501,9 @@ async def setup_database_indexes(mongo):
         await mongo.files.create_index("parent")
         await mongo.files.create_index("uploadId", sparse=True)
         await mongo.files.create_index("uploaded_at")
-        await mongo.files.create_index("status") 
+        await mongo.files.create_index("status")
+        await mongo.files.create_index("stream_bot_name")
+        await mongo.users.create_index("login", unique=True)
         logger.info("✅ Índices verificados.")
     except Exception as e: logger.warning(f"⚠️ Aviso índices: {e}")
 
@@ -334,11 +511,12 @@ GC_INTERVAL_SECONDS = int(environ.get("GC_INTERVAL_SECONDS", 60))
 
 async def garbage_collector(mongo):
     logger.info(f"🧹 Garbage Collector Iniciado (Max Age: {MAX_STAGING_AGE}s, Intervalo: {GC_INTERVAL_SECONDS}s)")
-    staging_dir = "staging"
     while True:
         try:
             now = time.time()
-            if os.path.exists(staging_dir):
+            for staging_dir in STAGING_DIRS:
+                if not os.path.exists(staging_dir):
+                    continue
                 for root, dirs, files in os.walk(staging_dir):
                     for f in files:
                         if f.endswith(".partial"): continue
@@ -377,8 +555,8 @@ async def folder_watcher(mongo):
     Mapeia arquivos para a PASTA DO UTILIZADOR.
     """
     logger.info("👀 Folder Watcher Iniciado")
-    staging_dir = "staging"
-    if not os.path.exists(staging_dir): os.makedirs(staging_dir)
+    for staging_dir in STAGING_DIRS:
+        os.makedirs(staging_dir, exist_ok=True)
 
     target_root = "/" 
     try:
@@ -393,7 +571,12 @@ async def folder_watcher(mongo):
 
     while True:
         try:
-            for root, dirs, files in os.walk(staging_dir):
+            for staging_dir in STAGING_DIRS:
+                if not os.path.exists(staging_dir):
+                    continue
+                for root, dirs, files in os.walk(staging_dir):
+                    if os.path.normcase(root) == os.path.normcase(staging_dir):
+                        dirs[:] = [name for name in dirs if name.lower() != "strm"]
                 for f in files:
                     if f.endswith(".partial"): continue
                     if not is_uploadable_name(f): continue
@@ -496,10 +679,44 @@ async def folder_watcher(mongo):
         
         await asyncio.sleep(5)
 
+
+async def cleanup_strm_duplicate_records(mongo):
+    pattern = re.compile(r"^[0-9a-f]{24}\.[^.]+$", re.IGNORECASE)
+    removed = 0
+    async for doc in mongo.files.find(
+        {"type": "file", "name": {"$regex": pattern}},
+        {"_id": 1, "name": 1, "local_path": 1, "size": 1},
+    ):
+        local_path = doc.get("local_path")
+        if not local_path:
+            continue
+        sibling = None
+        async for candidate in mongo.files.find(
+            {
+                "_id": {"$ne": doc["_id"]},
+                "type": "file",
+                "size": doc.get("size"),
+                "name": {"$not": pattern},
+            },
+            {"_id": 1, "local_path": 1},
+        ):
+            candidate_path = candidate.get("local_path")
+            if candidate_path and os.path.basename(candidate_path) == os.path.basename(local_path):
+                sibling = candidate
+                break
+        if sibling:
+            await mongo.files.delete_one({"_id": doc["_id"]})
+            removed += 1
+    if removed:
+        logger.warning("Removidos %s registros temporarios STRM duplicados.", removed)
+
+
 async def restore_pending_uploads(mongo):
     count = 0
     query = {"type": "file", "status": {"$in": ["queued", "uploading", "staging"]}, "local_path": {"$exists": True}}
-    async for doc in mongo.files.find(query):
+    pending = [doc async for doc in mongo.files.find(query)]
+    pending.sort(key=lambda doc: not is_staging_path(doc.get("local_path")))
+    for doc in pending:
         local_path = doc.get("local_path")
         if not local_path or not os.path.exists(local_path):
             await mongo.files.update_one(
@@ -508,7 +725,26 @@ async def restore_pending_uploads(mongo):
             )
             continue
         parent = await resolve_media_parent(mongo, doc["parent"], doc["name"])
-        await mongo.files.update_one({"_id": doc["_id"]}, {"$set": {"status": "queued", "parent": parent}})
+        duplicate = await mongo.files.find_one(
+            {"_id": {"$ne": doc["_id"]}, "parent": parent, "name": doc["name"]},
+            {"_id": 1},
+        )
+        if duplicate:
+            await mongo.files.update_one(
+                {"_id": doc["_id"]},
+                {"$set": {"status": "failed", "failed_at": int(time.time()), "failed_reason": "duplicate_target"}},
+            )
+            logger.warning("Fila restaurada ignorou duplicado: %s em %s", doc["name"], parent)
+            continue
+        try:
+            await mongo.files.update_one({"_id": doc["_id"]}, {"$set": {"status": "staging", "parent": parent}})
+        except DuplicateKeyError:
+            await mongo.files.update_one(
+                {"_id": doc["_id"]},
+                {"$set": {"status": "failed", "failed_at": int(time.time()), "failed_reason": "duplicate_target"}},
+            )
+            logger.warning("Fila restaurada encontrou duplicado concorrente: %s em %s", doc["name"], parent)
+            continue
         await UPLOAD_QUEUE.put({
             "path": local_path,
             "filename": doc["name"],
@@ -522,7 +758,7 @@ async def restore_pending_uploads(mongo):
 async def queued_mongo_scanner(mongo):
     while True:
         try:
-            for _ in range(MAX_WORKERS):
+            for _ in range(min(MAX_WORKERS, UPLOAD_CONCURRENCY)):
                 doc = await mongo.files.find_one_and_update(
                     {"type": "file", "status": "queued", "local_path": {"$exists": True}},
                     {"$set": {"status": "staging", "staged_at": int(time.time())}},
@@ -548,7 +784,7 @@ async def queued_mongo_scanner(mongo):
             logger.warning("scanner Mongo aguardando: %s", exc)
         await asyncio.sleep(1)
 
-async def upload_part_with_retries(worker_id, bots, target_chat_id, local_path, file_uuid, part_num, chunk_data=None):
+async def upload_part_with_retries(worker_id, bots, target_chat_id, local_path, file_uuid, part_num, chunk_data=None, bot_index_offset=0):
     """Upload a single part with bot rotation on FloodWait.
 
     Instead of being pinned to one bot, this function accepts the full bots
@@ -566,36 +802,77 @@ async def upload_part_with_retries(worker_id, bots, target_chat_id, local_path, 
     if not chunk_data:
         raise Exception(f"Parte vazia {part_num}")
 
-    # Start rotation from part_num % len(bots) so different parts
-    # in the same batch prefer different bots from the start.
-    current_bot_idx = part_num % len(bots)
+    # Reserve distinct bot slots per file worker; parts inside one batch
+    # still spread across adjacent bots.
+    current_bot_idx = (
+        (worker_id - 1) * PART_WORKERS_PER_FILE
+        + (part_num % PART_WORKERS_PER_FILE)
+    ) % len(bots)
     sent_msg = None
-    for attempt in range(1, MAX_RETRIES + 1):
+    attempt = 1
+    while attempt <= MAX_RETRIES:
         part_bot = bots[current_bot_idx % len(bots)]
+        bot_number = bot_index_offset + (current_bot_idx % len(bots)) + 1
+        bot_name = getattr(part_bot, "name", None)
+        await _wait_for_streaming(part_bot)
+        preemption_state = {"preempted": False}
         try:
-            sent_msg = await part_bot.send_document(
-                chat_id=target_chat_id,
-                document=io.BytesIO(chunk_data),
-                file_name=chunk_name,
-                force_document=True,
-                caption="",
+            started_at = time.monotonic()
+            logger.info("[UPLOAD] W%s parte=%s bot=#%s iniciando", worker_id, part_num, bot_number)
+            async with get_upload_semaphore():
+                sent_msg = await _send_part_document(
+                    part_bot,
+                    target_chat_id,
+                    chunk_data,
+                    chunk_name,
+                    preemption_state,
+                )
+            if sent_msg is None and preemption_state["preempted"]:
+                logger.info(
+                    "[UPLOAD] W%s parte=%s pausada para streaming no bot=#%s",
+                    worker_id,
+                    part_num,
+                    bot_number,
+                )
+                await _wait_for_streaming(part_bot)
+                continue
+            if sent_msg is None:
+                raise RuntimeError("Telegram encerrou o upload sem retornar mensagem")
+            elapsed = max(time.monotonic() - started_at, 0.001)
+            logger.info(
+                "[UPLOAD] W%s parte=%s bot=#%s concluida em %.1fs (%.2f MB/s)",
+                worker_id, part_num, bot_number, elapsed,
+                len(chunk_data) / 1024 / 1024 / elapsed,
             )
             break
         except FloodWait as e:
             w = e.value + 2
             logger.warning(
-                f"[W{worker_id}] FloodWait bot#{current_bot_idx + 1}: {w}s, "
+                f"[W{worker_id}] FloodWait bot#{bot_number}: {w}s, "
                 f"rotating to next bot"
             )
-            await asyncio.sleep(w)
-            # Rotate to next bot for retry
+            attempt += 1
             current_bot_idx += 1
+            if len(bots) == 1:
+                await asyncio.sleep(w)
+        except (TimeoutError, ConnectionError) as e:
+            logger.warning(
+                "[W%s] Timeout bot#%s: %s; rotating to next bot",
+                worker_id,
+                bot_number,
+                e,
+            )
+            attempt += 1
+            current_bot_idx += 1
+            await asyncio.sleep(1)
         except RPCError as e:
             w = 2 ** attempt
-            logger.error(f"[W{worker_id}] Erro TG ({attempt}) bot#{current_bot_idx + 1}: {e}")
+            logger.error(f"[W{worker_id}] Erro TG ({attempt}) bot#{bot_number}: {e}")
+            attempt += 1
             await asyncio.sleep(w)
         except Exception as e:
             logger.error(f"[W{worker_id}] Erro: {e}")
+            attempt += 1
             await asyncio.sleep(5)
     if not sent_msg:
         raise Exception(f"Falha upload parte {part_num}")
@@ -605,11 +882,19 @@ async def upload_part_with_retries(worker_id, bots, target_chat_id, local_path, 
         "tg_message": sent_msg.id,
         "file_size": len(chunk_data),
         "chunk_name": chunk_name,
-        "bot_index": current_bot_idx % len(bots),
+        "bot_index": bot_index_offset + (current_bot_idx % len(bots)),
+        "bot_name": bot_name,
     }
 
 
-async def _readahead_producer(local_path, total_parts, queue, worker_id):
+async def _readahead_producer(
+    local_path,
+    total_parts,
+    queue,
+    worker_id,
+    start_part=0,
+    start_offset=None,
+):
     """Pre-read file chunks into an async queue ahead of upload workers.
 
     This overlaps disk I/O with network I/O: while workers upload chunk N,
@@ -617,7 +902,11 @@ async def _readahead_producer(local_path, total_parts, queue, worker_id):
     bounds memory usage to ``queue.maxsize * CHUNK_SIZE`` bytes.
     """
     async with aiofiles.open(local_path, "rb") as f:
-        for part_num in range(total_parts):
+        if start_offset is None:
+            start_offset = start_part * CHUNK_SIZE
+        if start_offset:
+            await f.seek(start_offset)
+        for part_num in range(start_part, total_parts):
             chunk_data = await f.read(CHUNK_SIZE)
             if not chunk_data:
                 break
@@ -721,9 +1010,13 @@ async def upload_worker(bot, target_chat_id, mongo, worker_id, bot_index=0):
                         if not sent_msg: raise Exception(f"Falha upload parte {part_num}")
 
                         parts_metadata.append({
-                            "part_id": part_num, "tg_file": sent_msg.document.file_id,
-                            "tg_message": sent_msg.id, "file_size": len(chunk_data),
-                            "chunk_name": chunk_name, "bot_index": bot_index
+                            "part_id": part_num,
+                            "tg_file": sent_msg.document.file_id,
+                            "tg_message": sent_msg.id,
+                            "file_size": len(chunk_data),
+                            "chunk_name": chunk_name,
+                            "bot_index": bot_index,
+                            "bot_name": getattr(bot, "name", None),
                         })
                         uploaded_bytes += len(chunk_data)
                         part_num += 1
@@ -755,7 +1048,7 @@ async def upload_worker(bot, target_chat_id, mongo, worker_id, bot_index=0):
             if not upload_failed:
                 await mongo.files.update_one(
                     {"_id": file_doc["_id"]},
-                    {"$set": {"size": real_size, "uploaded_at": int(time.time()), "parts": parts_metadata, "obfuscated_id": file_uuid, "status": "completed"}, "$unset": {"uploadId": 1, "local_path": 1}}
+                    {"$set": {"size": real_size, "uploaded_at": int(time.time()), "parts": parts_metadata, "obfuscated_id": file_uuid, "status": "completed", "stream_bot_name": getattr(bot, "name", None)}, "$unset": {"uploadId": 1, "local_path": 1}}
                 )
                 async with MongoDBPathIO._cache_lock:
                     MongoDBPathIO._memory_cache.pop(f"{parent}::{filename}", None)
@@ -802,13 +1095,6 @@ async def upload_worker_parallel(bots, target_chat_id, mongo, worker_id):
                 continue
 
             parent = await resolve_media_parent(mongo, parent, filename)
-            total_parts = max(1, (real_size + CHUNK_SIZE - 1) // CHUNK_SIZE)
-            logger.info(
-                f"[W{worker_id}] Iniciando upload: {filename} "
-                f"tamanho={real_size/1024/1024:.2f} MB partes={total_parts} "
-                f"paralelo={PART_WORKERS_PER_FILE} bots={len(bots)}"
-            )
-
             file_doc = await mongo.files.find_one({"name": filename, "parent": parent})
             if not file_doc:
                 file_doc = await mongo.files.find_one({"name": filename, "local_path": local_path})
@@ -826,19 +1112,53 @@ async def upload_worker_parallel(bots, target_chat_id, mongo, worker_id):
                 continue
             await log_queue_state(mongo, f"inicio:{filename}")
 
-            file_uuid = str(uuid.uuid4())
-            uploaded_bytes = 0
-            parts_metadata = []
+            parts_metadata = get_contiguous_uploaded_parts(file_doc.get("parts"))
+            resume_part = len(parts_metadata)
+            uploaded_bytes = sum(int(part["file_size"]) for part in parts_metadata)
+            if uploaded_bytes > real_size:
+                raise RuntimeError(
+                    f"Metadados excedem arquivo: {uploaded_bytes}/{real_size} bytes"
+                )
+            remaining_bytes = real_size - uploaded_bytes
+            remaining_parts = (remaining_bytes + CHUNK_SIZE - 1) // CHUNK_SIZE
+            total_parts = resume_part + remaining_parts
+            logger.info(
+                f"[W{worker_id}] Iniciando upload: {filename} "
+                f"tamanho={real_size/1024/1024:.2f} MB partes={total_parts} "
+                f"paralelo={PART_WORKERS_PER_FILE} bots={len(bots)}"
+            )
+            first_chunk_name = parts_metadata[0].get("chunk_name", "") if parts_metadata else ""
+            file_uuid = (
+                first_chunk_name.rsplit(".part_", 1)[0]
+                if ".part_" in first_chunk_name
+                else str(uuid.uuid4())
+            )
+            if resume_part:
+                logger.info(
+                    "[W%s] Retomando %s na parte %s/%s (%.2f MB ja enviados)",
+                    worker_id,
+                    filename,
+                    resume_part,
+                    total_parts,
+                    uploaded_bytes / 1024 / 1024,
+                )
 
             # --- Read-ahead: start producer that fills a bounded queue ---
             readahead_queue: asyncio.Queue = asyncio.Queue(
                 maxsize=PART_WORKERS_PER_FILE
             )
             producer_task = asyncio.create_task(
-                _readahead_producer(local_path, total_parts, readahead_queue, worker_id)
+                _readahead_producer(
+                    local_path,
+                    total_parts,
+                    readahead_queue,
+                    worker_id,
+                    resume_part,
+                    uploaded_bytes,
+                )
             )
 
-            for start_part in range(0, total_parts, PART_WORKERS_PER_FILE):
+            for start_part in range(resume_part, total_parts, PART_WORKERS_PER_FILE):
                 batch_end = min(start_part + PART_WORKERS_PER_FILE, total_parts)
                 batch_size = batch_end - start_part
 
@@ -856,7 +1176,7 @@ async def upload_worker_parallel(bots, target_chat_id, mongo, worker_id):
                 async def _upload_one(pn: int) -> dict:
                     chunk_data = chunk_map.get(pn)
                     return await upload_part_with_retries(
-                        worker_id, bots, target_chat_id, local_path, file_uuid, pn, chunk_data
+                        worker_id, bots, target_chat_id, local_path, file_uuid, pn, chunk_data, 1
                     )
 
                 results = await asyncio.gather(
@@ -866,9 +1186,10 @@ async def upload_worker_parallel(bots, target_chat_id, mongo, worker_id):
                 parts_metadata.sort(key=lambda item: item["part_id"])
                 uploaded_bytes += sum(item["file_size"] for item in results)
                 percent = uploaded_bytes / real_size * 100
+                stream_bot_name = next((item.get("bot_name") for item in parts_metadata if item.get("bot_name")), None)
                 await mongo.files.update_one(
                     {"_id": file_doc["_id"]},
-                    {"$set": {"uploaded_bytes": uploaded_bytes, "parts": parts_metadata}}
+                    {"$set": {"uploaded_bytes": uploaded_bytes, "parts": parts_metadata, "stream_bot_name": stream_bot_name}}
                 )
                 logger.debug(
                     f"[W{worker_id}] Progresso: {filename} parte={batch_end}/{total_parts} "
@@ -881,6 +1202,15 @@ async def upload_worker_parallel(bots, target_chat_id, mongo, worker_id):
                 with contextlib.suppress(asyncio.CancelledError):
                     await producer_task
 
+            if len(parts_metadata) != total_parts or uploaded_bytes != real_size:
+                raise RuntimeError(
+                    f"Upload incompleto: partes={len(parts_metadata)}/{total_parts} "
+                    f"bytes={uploaded_bytes}/{real_size}"
+                )
+            stream_bot_name = next(
+                (item.get("bot_name") for item in parts_metadata if item.get("bot_name")),
+                None,
+            )
             await mongo.files.update_one(
                 {"_id": file_doc["_id"]},
                 {
@@ -890,6 +1220,7 @@ async def upload_worker_parallel(bots, target_chat_id, mongo, worker_id):
                         "parts": parts_metadata,
                         "obfuscated_id": file_uuid,
                         "status": "completed",
+                        "stream_bot_name": stream_bot_name,
                     },
                     "$unset": {"uploadId": 1, "local_path": 1},
                 },
@@ -930,23 +1261,30 @@ async def resolve_channel(bot):
     except Exception as e:
         logger.critical(f"❌ Canal inválido '{target_chat}': {e}"); return None
 
-def http_headers(status, content_type, body=b"", extra=None):
-    reason = {200: "OK", 206: "Partial Content", 400: "Bad Request", 404: "Not Found", 500: "Server Error"}.get(status, "OK")
+def http_headers(status, content_type, body=b"", extra=None, include_body=True):
+    reason = {
+        200: "OK",
+        206: "Partial Content",
+        400: "Bad Request",
+        401: "Unauthorized",
+        404: "Not Found",
+        416: "Range Not Satisfiable",
+        500: "Server Error",
+    }.get(status, "OK")
     headers = {
         "Content-Type": content_type,
         "Content-Length": str(len(body)),
         "Connection": "close",
-        "Access-Control-Allow-Origin": "*",
     }
     if extra:
         headers.update(extra)
     head = [f"HTTP/1.1 {status} {reason}", *[f"{k}: {v}" for k, v in headers.items()], "", ""]
-    return "\r\n".join(head).encode("utf-8") + body
+    return "\r\n".join(head).encode("utf-8") + (body if include_body else b"")
 
 
-async def http_write_json(writer, data, status=200):
+async def http_write_json(writer, data, status=200, head_only=False):
     body = json.dumps(data, ensure_ascii=False).encode("utf-8")
-    writer.write(http_headers(status, "application/json; charset=utf-8", body))
+    writer.write(http_headers(status, "application/json; charset=utf-8", body, include_body=not head_only))
     await writer.drain()
 
 
@@ -967,15 +1305,16 @@ async def list_completed_files(mongo, query, limit):
             "size": doc.get("size", 0),
             "uploaded_at": doc.get("uploaded_at"),
             "stream": f"/stream?id={quote(str(doc['_id']))}",
+            "play": f"/play?id={quote(str(doc['_id']))}",
         })
     return files
 
 
-async def http_index(writer, mongo, query):
+async def http_index(writer, mongo, query, head_only=False):
     files = await list_completed_files(mongo, query, 100)
     rows = "\n".join(
         f"<tr><td>{escape(f['path'])}</td><td>{f['size']}</td>"
-        f"<td><a href='{f['stream']}'>stream/download</a></td></tr>"
+        f"<td><a href='{f['play']}'>assistir</a> | <a href='{f['stream']}'>baixar</a></td></tr>"
         for f in files
     )
     body = f"""<!doctype html>
@@ -986,8 +1325,123 @@ async def http_index(writer, mongo, query):
 <form><input name="q" value="{escape(query)}" placeholder="Buscar filme ou serie"><button>Buscar</button></form>
 <p>{len(files)} arquivo(s)</p>
 <table>{rows}</table>""".encode("utf-8")
-    writer.write(http_headers(200, "text/html; charset=utf-8", body))
+    writer.write(http_headers(200, "text/html; charset=utf-8", body, include_body=not head_only))
     await writer.drain()
+
+
+async def http_player(writer, mongo, file_id, head_only=False):
+    try:
+        obj_id = ObjectId(file_id)
+    except Exception:
+        writer.write(
+            http_headers(
+                400,
+                "text/plain; charset=utf-8",
+                b"id invalido",
+                include_body=not head_only,
+            )
+        )
+        await writer.drain()
+        return
+    doc = await mongo.files.find_one({"_id": obj_id, "status": "completed"}, {"name": 1})
+    if not doc:
+        writer.write(
+            http_headers(
+                404,
+                "text/plain; charset=utf-8",
+                b"arquivo nao encontrado",
+                include_body=not head_only,
+            )
+        )
+        await writer.drain()
+        return
+    name = str(doc.get("name", "media"))
+    direct = os.path.splitext(name)[1].lower() in {".mp4", ".m4v", ".webm", ".ogg", ".ogv"}
+    source = f"/stream?id={quote(file_id)}" if direct else f"/transcode?id={quote(file_id)}"
+    body = f"""<!doctype html>
+<meta charset="utf-8">
+<title>{escape(name)}</title>
+<style>html,body{{margin:0;background:#000;height:100%}}video{{width:100%;height:100%;object-fit:contain}}</style>
+<video controls autoplay src="{source}"></video>""".encode("utf-8")
+    writer.write(http_headers(200, "text/html; charset=utf-8", body, include_body=not head_only))
+    await writer.drain()
+
+
+async def _transcode_completed_file(writer, mongo, file_id, head_only=False):
+    try:
+        obj_id = ObjectId(file_id)
+    except Exception:
+        writer.write(
+            http_headers(
+                400,
+                "text/plain; charset=utf-8",
+                b"id invalido",
+                include_body=not head_only,
+            )
+        )
+        await writer.drain()
+        return
+    doc = await mongo.files.find_one(
+        {"_id": obj_id, "status": "completed"},
+        {"name": 1},
+    )
+    if not doc:
+        writer.write(
+            http_headers(
+                404,
+                "text/plain; charset=utf-8",
+                b"arquivo nao encontrado",
+                include_body=not head_only,
+            )
+        )
+        await writer.drain()
+        return
+    if head_only:
+        writer.write(http_headers(200, "video/mp4"))
+        await writer.drain()
+        return
+    input_url = f"http://127.0.0.1:{STREAM_PORT}/stream?id={quote(file_id)}"
+    extension = os.path.splitext(str(doc.get("name", "")))[1].lower()
+    codec_args = (
+        ["-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-sn"]
+        if extension == ".mkv"
+        else ["-c:v", "libx264", "-preset", "ultrafast", "-g", "48",
+              "-keyint_min", "48", "-sc_threshold", "0", "-c:a", "aac"]
+    )
+    process = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-loglevel", "error", "-probesize", "8M",
+        "-analyzeduration", "5M", "-seekable", "0", "-i", input_url, *codec_args,
+        "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+        "-f", "mp4", "pipe:1",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+    )
+    writer.write(
+        b"HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\n"
+        b"Cache-Control: no-store\r\nTransfer-Encoding: chunked\r\n"
+        b"Connection: close\r\n\r\n"
+    )
+    await writer.drain()
+    try:
+        while chunk := await process.stdout.read(1024 * 1024):
+            writer.write(f"{len(chunk):X}\r\n".encode("ascii") + chunk + b"\r\n")
+            await writer.drain()
+        writer.write(b"0\r\n\r\n")
+        await writer.drain()
+    finally:
+        if process.returncode is None:
+            process.terminate()
+        with contextlib.suppress(Exception):
+            await process.wait()
+
+
+async def transcode_completed_file(writer, mongo, file_id, head_only=False):
+    if head_only:
+        await _transcode_completed_file(writer, mongo, file_id, True)
+        return
+    async with get_transcode_semaphore():
+        await _transcode_completed_file(writer, mongo, file_id, head_only)
 
 
 def parse_range(value, size):
@@ -997,29 +1451,61 @@ def parse_range(value, size):
     endpoint) still import ``parse_range`` from this module. New code
     should import directly from ``ftp.range``.
     """
-    from ftp.range import parse_range as _impl
-    return _impl(value, size)
+    return _parse_range(value, size)
 
 
-async def stream_completed_file(writer, mongo, bots, file_id, range_header):
+async def stream_completed_file(writer, mongo, bots, file_id, range_header, head_only=False):
     try:
         obj_id = ObjectId(file_id)
     except Exception:
-        writer.write(http_headers(400, "text/plain; charset=utf-8", b"id invalido"))
+        writer.write(
+            http_headers(
+                400,
+                "text/plain; charset=utf-8",
+                b"id invalido",
+                include_body=not head_only,
+            )
+        )
         await writer.drain()
         return
     doc = await mongo.files.find_one({"_id": obj_id, "type": "file", "status": "completed", "parts.0": {"$exists": True}})
     if not doc:
-        writer.write(http_headers(404, "text/plain; charset=utf-8", b"arquivo nao encontrado"))
+        writer.write(
+            http_headers(
+                404,
+                "text/plain; charset=utf-8",
+                b"arquivo nao encontrado",
+                include_body=not head_only,
+            )
+        )
         await writer.drain()
         return
     size = int(doc.get("size") or 0)
     start, end, status = parse_range(range_header, size)
-    if size <= 0 or start > end:
-        writer.write(http_headers(404, "text/plain; charset=utf-8", b"arquivo vazio"))
+    if status == 416:
+        writer.write(
+            http_headers(
+                416,
+                "text/plain; charset=utf-8",
+                b"",
+                {"Content-Range": f"bytes */{max(size, 0)}"},
+                include_body=not head_only,
+            )
+        )
         await writer.drain()
         return
-    filename = str(doc.get("name", "media.bin")).replace('"', "")
+    if size <= 0 or start > end:
+        writer.write(
+            http_headers(
+                404,
+                "text/plain; charset=utf-8",
+                b"arquivo vazio",
+                include_body=not head_only,
+            )
+        )
+        await writer.drain()
+        return
+    filename = str(doc.get("name", "media.bin")).replace('"', "").replace("\r", "").replace("\n", "")
     content_type, _ = mimetypes.guess_type(filename)
     if not content_type:
         content_type = "application/octet-stream"
@@ -1037,6 +1523,8 @@ async def stream_completed_file(writer, mongo, bots, file_id, range_header):
         (f"HTTP/1.1 {status} {reason}\r\n" + "\r\n".join(f"{k}: {v}" for k, v in headers.items()) + "\r\n\r\n").encode("utf-8")
     )
     await writer.drain()
+    if head_only:
+        return
     reader = MongoDBMemoryIO(Node(**doc), "rb", bots, mongo)
     await reader.seek(start)
     sent = 0
@@ -1063,14 +1551,46 @@ async def handle_http_client(reader, writer, mongo, bots):
             writer.write(http_headers(400, "text/plain; charset=utf-8", b"metodo invalido"))
             await writer.drain()
             return
+        head_only = method == "HEAD"
+        peer_host = writer.get_extra_info("peername", ("", 0))[0]
+        if STREAM_TOKEN and not is_loopback_host(str(peer_host)) and not hmac.compare_digest(
+            headers.get("authorization", ""),
+            f"Bearer {STREAM_TOKEN}",
+        ):
+            writer.write(
+                http_headers(
+                    401,
+                    "application/json; charset=utf-8",
+                    b'{"error":"unauthorized"}',
+                    {"WWW-Authenticate": "Bearer", "Cache-Control": "no-store"},
+                    include_body=not head_only,
+                )
+            )
+            await writer.drain()
+            return
         url = urlsplit(target)
         params = parse_qs(url.query)
         if url.path == "/api/files":
-            await http_write_json(writer, await list_completed_files(mongo, params.get("q", [""])[0], params.get("limit", ["100"])[0]))
+            await http_write_json(
+                writer,
+                await list_completed_files(mongo, params.get("q", [""])[0], params.get("limit", ["100"])[0]),
+                head_only=head_only,
+            )
+        elif url.path == "/play":
+            await http_player(writer, mongo, params.get("id", [""])[0], head_only)
+        elif url.path == "/transcode":
+            await transcode_completed_file(writer, mongo, params.get("id", [""])[0], head_only)
         elif url.path == "/stream":
-            await stream_completed_file(writer, mongo, bots, params.get("id", [""])[0], headers.get("range"))
+            await stream_completed_file(
+                writer,
+                mongo,
+                bots,
+                params.get("id", [""])[0],
+                headers.get("range"),
+                head_only,
+            )
         else:
-            await http_index(writer, mongo, params.get("q", [""])[0])
+            await http_index(writer, mongo, params.get("q", [""])[0], head_only)
     except Exception as exc:
         if isinstance(exc, (ConnectionResetError, BrokenPipeError, asyncio.IncompleteReadError)):
             logger.debug("HTTP stream desconectado: %s", exc)
@@ -1091,6 +1611,10 @@ async def start_http_stream_server(mongo, bots):
     return server
 
 def get_required_config():
+    if PASSIVE_PORTS_ERROR:
+        raise RuntimeError(f"PASSIVE_PORTS invalido: {PASSIVE_PORTS_ERROR}")
+    if not is_loopback_host(STREAM_HOST) and len(STREAM_TOKEN) < 32:
+        raise RuntimeError("STREAM_TOKEN must contain at least 32 characters for non-loopback streaming")
     missing = [key for key in ("API_ID", "API_HASH", "MONGODB", "CHAT_ID") if not environ.get(key)]
     tokens = [t.strip() for t in (environ.get("BOT_TOKENS") or environ.get("BOT_TOKEN") or "").split(",") if t.strip()]
     if not tokens:
@@ -1116,27 +1640,50 @@ async def main():
             api_id=api_id,
             api_hash=api_hash,
             bot_token=token,
-            in_memory=True,
+            no_updates=True,
+            workers=1,
+            max_concurrent_transmissions=1,
         )
         for idx, token in enumerate(tokens)
     ]
+    for bot, token in zip(bots, tokens):
+        bot._nebula_bot_token = token
     logger.info("🤖 Iniciando %s bot(s)...", len(bots))
+    active_bots = []
     try:
-        for bot in bots:
-            await bot.start()
+        for idx, bot in enumerate(bots, start=1):
+            try:
+                await bot.start()
+                active_bots.append(bot)
+            except FloodWait as exc:
+                logger.warning(
+                    "Bot #%s temporariamente indisponivel por %ss; iniciando sem ele.",
+                    idx,
+                    exc.value,
+                )
     except Exception as e:
         logger.critical(f"❌ Falha ao iniciar bot: {e}")
-        for started in bots:
+        for started in active_bots:
             with contextlib.suppress(Exception):
                 await started.stop()
         return 1
 
-    target_chat_id = await resolve_channel(bots[0])
+    bots = active_bots
+    if not bots:
+        logger.critical("Nenhum bot disponivel para iniciar o servidor.")
+        return 1
+    logger.info("Bots ativos nesta execucao: %s de %s.", len(bots), len(tokens))
+
+    materializer_bot = bots[0]
+    upload_bots = bots[1:] or bots
+
+    target_chat_id = await resolve_channel(materializer_bot)
     if not target_chat_id:
         for bot in bots:
             await bot.stop()
         return 1
-    for idx, bot in enumerate(bots[1:], start=2):
+    confirm_bots = upload_bots if upload_bots is not bots else bots[1:]
+    for idx, bot in enumerate(confirm_bots, start=2 if len(bots) > 1 else 1):
         try:
             await bot.get_chat(target_chat_id)
             logger.info("Bot #%s confirmado no canal.", idx)
@@ -1149,7 +1696,9 @@ async def main():
 
     loop = asyncio.get_event_loop()
     try:
-        mongo = AsyncIOMotorClient(environ.get("MONGODB"), io_loop=loop, w="majority").ftp
+        mongo_uri = environ.get("MONGODB")
+        mongo_database = environ.get("MONGO_DATABASE", "ftp")
+        mongo = AsyncIOMotorClient(mongo_uri, io_loop=loop, w="majority")[mongo_database]
         await setup_database_indexes(mongo)
     except Exception as e:
         logger.critical(f"❌ Erro DB: {e}")
@@ -1158,18 +1707,41 @@ async def main():
         return 1
     
     MongoDBPathIO.db = mongo; MongoDBPathIO.tg = bots
-    server = Server(MongoDBUserManager(mongo), MongoDBPathIO)
+    try:
+        tls_enabled = validate_ftp_security(
+            FTP_SECURITY_MODE,
+            TLS_CERTFILE,
+            TLS_KEYFILE,
+            TLS_REQUIRED,
+        )
+    except ValueError as exc:
+        logger.critical("FTP security configuration failed: %s", exc)
+        for bot in bots:
+            await bot.stop()
+        return 1
+    server = Server(
+        MongoDBUserManager(mongo),
+        MongoDBPathIO,
+        passive_ports=PASSIVE_PORTS,
+        security_mode=FTP_SECURITY_MODE,
+    )
     http_stream_server = None
-    if TLS_CERTFILE and TLS_KEYFILE:
+    if tls_enabled:
         try:
             tlscfg = server._build_ssl_context(TLS_CERTFILE, TLS_KEYFILE, TLS_REQUIRE_CLIENT_CERT)
             server.set_ssl_context(tlscfg)
-            logger.info(f"🔐 FTPS enabled: cert={TLS_CERTFILE} require_client_cert={TLS_REQUIRE_CLIENT_CERT}")
+            logger.info(
+                "FTPS enabled: mode=%s require_client_cert=%s",
+                FTP_SECURITY_MODE,
+                TLS_REQUIRE_CLIENT_CERT,
+            )
         except (FileNotFoundError, ssl.SSLError, OSError) as exc:
-            logger.critical(f"❌ TLS configuration failed ({exc}); falling back to plaintext FTP. Set TLS_CERTFILE/TLS_KEYFILE properly or leave both blank to disable FTPS.")
-            server.set_ssl_context(None)
+            logger.critical("TLS configuration failed; refusing plaintext fallback: %s", exc)
+            for bot in bots:
+                await bot.stop()
+            return 1
     else:
-        logger.warning("⚠️  FTPS disabled (TLS_CERTFILE/TLS_KEYFILE not set). Credentials and payloads will travel in clear — do not expose this beyond localhost.")
+        logger.warning("FTPS disabled. Plain FTP must not be exposed beyond a trusted network.")
 
     host = environ.get("HOST", "0.0.0.0")
     port = int(environ.get("PORT", 2121))
@@ -1186,18 +1758,100 @@ async def main():
     except OSError as exc:
         logger.warning("HTTP Stream nao iniciado em %s:%s: %s", STREAM_HOST, STREAM_PORT, exc)
 
-    asyncio.create_task(garbage_collector(mongo))
-    asyncio.create_task(stats_reporter(mongo))
-    asyncio.create_task(folder_watcher(mongo))
-    asyncio.create_task(queued_mongo_scanner(mongo))
-    await restore_pending_uploads(mongo)
-
-    for i in range(MAX_WORKERS):
-        asyncio.create_task(upload_worker_parallel(bots, target_chat_id, mongo, i + 1))
+    background_tasks = [
+        asyncio.create_task(garbage_collector(mongo)),
+        asyncio.create_task(stats_reporter(mongo)),
+    ]
+    folder_task = None
+    if STREAM_ONLY:
+        logger.info("Modo somente streaming: feeder, fila e workers de upload desativados.")
+    else:
+        await cleanup_strm_duplicate_records(mongo)
+        folder_task = asyncio.create_task(folder_watcher(mongo))
+        background_tasks.append(folder_task)
+        background_tasks.append(asyncio.create_task(queued_mongo_scanner(mongo)))
+        await restore_pending_uploads(mongo)
+        upload_worker_count = get_upload_worker_count(len(upload_bots))
+        logger.info(
+            "Workers de upload ativos: %s (configurados=%s, transmissoes=%s, bots=%s).",
+            upload_worker_count,
+            MAX_WORKERS,
+            UPLOAD_CONCURRENCY,
+            len(upload_bots),
+        )
+        for i in range(upload_worker_count):
+            background_tasks.append(
+                asyncio.create_task(upload_worker_parallel(upload_bots, target_chat_id, mongo, i + 1))
+            )
 
     ftp_server_task = asyncio.create_task(server.serve_forever())
-    
     stop_event = asyncio.Event()
+    control_plane = None
+
+    async def drain_and_stop():
+        server.stop_accepting()
+        if folder_task:
+            folder_task.cancel()
+        try:
+            deadline = asyncio.get_running_loop().time() + CONTROL_DRAIN_TIMEOUT
+            while asyncio.get_running_loop().time() < deadline:
+                pending = await mongo.files.count_documents(
+                    {"type": "file", "status": {"$in": ["queued", "staging", "uploading"]}}
+                )
+                if not server.connections and pending == 0 and UPLOAD_QUEUE.empty():
+                    break
+                await asyncio.sleep(0.5)
+        except Exception as exc:
+            logger.warning("Control drain status check failed: %s", exc)
+        finally:
+            stop_event.set()
+
+    if CONTROL_ENABLED:
+        try:
+            feeder = FeederSupervisor(
+                Path(__file__).resolve().parent / "tools" / "feed_ftp.py",
+                source_roots=FEED_ALLOWED_ROOTS,
+                destination_roots=FEED_ALLOWED_DESTINATIONS or FEED_ALLOWED_ROOTS,
+                state_dir=FEED_STATE_DIR,
+                stop_timeout=FEED_STOP_TIMEOUT,
+            )
+
+            async def control_status():
+                try:
+                    mongo_ready = bool((await mongo.command("ping")).get("ok"))
+                except Exception:
+                    mongo_ready = False
+                return {
+                    "mode": "stream-only" if STREAM_ONLY else "full",
+                    "mongoDb": "connected" if mongo_ready else "unreachable",
+                    "telegram": f"{len(bots)} bot(s) active",
+                    "ftp": f"{len(server.connections)} connection(s)",
+                    "streaming": "enabled" if http_stream_server is not None else "disabled",
+                    "ftp_connections": len(server.connections),
+                    "bots_active": len(bots),
+                    "stream_enabled": http_stream_server is not None,
+                }
+
+            control_plane = ControlPlane(
+                token=environ.get("CONTROL_TOKEN", ""),
+                mongo=mongo,
+                upload_queue=UPLOAD_QUEUE,
+                drain_callback=drain_and_stop,
+                status_provider=control_status,
+                feeder=feeder,
+                mongo_uri=mongo_uri,
+                database=mongo_database,
+                source_roots=FEED_ALLOWED_ROOTS,
+                output_roots=STRM_OUTPUT_ROOTS,
+                disconnect_user=server.disconnect_user,
+                prune_ttl=PRUNE_PREVIEW_TTL,
+            )
+            await control_plane.start(CONTROL_HOST, CONTROL_PORT)
+            control_plane.set_ready(True)
+            logger.info("Control plane v1 listening on %s:%s", CONTROL_HOST, control_plane.bound_port)
+        except (OSError, ValueError) as exc:
+            logger.critical("Control plane configuration failed: %s", exc)
+            stop_event.set()
     try:
         loop.add_signal_handler(signal.SIGINT, stop_event.set)
         loop.add_signal_handler(signal.SIGTERM, stop_event.set)
@@ -1208,6 +1862,9 @@ async def main():
     try:
         done, _pending = await asyncio.wait({stop_task, ftp_server_task}, return_when=asyncio.FIRST_COMPLETED)
         if ftp_server_task in done:
+            if control_plane and control_plane.draining:
+                await stop_task
+                return 0
             exc = ftp_server_task.exception()
             if exc:
                 logger.critical("❌ Servidor FTP parou com erro: %s", exc)
@@ -1216,6 +1873,8 @@ async def main():
     finally:
         stop_task.cancel()
         logger.info("⏳ Shutdown...")
+        if control_plane:
+            await control_plane.close()
         try:
             if not UPLOAD_QUEUE.empty(): await asyncio.wait_for(UPLOAD_QUEUE.join(), timeout=30)
         except (asyncio.TimeoutError, RuntimeError) as exc:
@@ -1224,6 +1883,9 @@ async def main():
             http_stream_server.close()
             await http_stream_server.wait_closed()
         await server.close()
+        for task in background_tasks:
+            task.cancel()
+        await asyncio.gather(*background_tasks, return_exceptions=True)
         for bot in bots:
             await bot.stop()
         logger.info("👋 Desligado.")

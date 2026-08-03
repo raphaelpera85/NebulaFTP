@@ -1,8 +1,10 @@
 import os
-import sys
+import re
+import stat
 from pathlib import Path, PurePosixPath
-from pymongo import MongoClient
+
 from dotenv import load_dotenv
+from pymongo import MongoClient
 
 if os.path.exists(".env"):
     load_dotenv()
@@ -10,56 +12,102 @@ if os.path.exists(".env"):
 mongo_uri = os.getenv("MONGODB", "mongodb://localhost:27017")
 host = os.getenv("STREAM_HOST", "127.0.0.1")
 port = os.getenv("STREAM_PORT", "2122")
-
-# Raiz do projeto onde será criada a estrutura de strm
 root_dir = Path(__file__).resolve().parent / "strm_library"
+WINDOWS_INVALID_NAME = re.compile(r'[<>:"/\\|?*]')
 
-def generate_strm_files():
-    client = MongoClient(mongo_uri)
-    db = client.ftp
 
-    completed_files = list(db.files.find({'type': 'file', 'status': 'completed'}))
-    print(f"Encontrados {len(completed_files)} arquivo(s) concluído(s) no MongoDB.")
+def safe_windows_name(value):
+    cleaned = WINDOWS_INVALID_NAME.sub(" - ", str(value))
+    cleaned = re.sub(r"\s+", " ", cleaned).rstrip(" .")
+    return cleaned or "_"
 
-    created_count = 0
 
-    for doc in completed_files:
-        file_id = str(doc["_id"])
-        name = doc.get("name", "")
-        parent = doc.get("parent", "")
+def stream_endpoint(name):
+    return "stream"
 
-        # Monta link HTTP Stream
-        stream_url = f"http://{host}:{port}/stream?id={file_id}"
 
-        # Normaliza caminho removendo o prefixo do usuário (/raphael)
-        p_path = PurePosixPath(parent)
-        parts = list(p_path.parts)
-        if parts and parts[0] == "/":
-            parts.pop(0)
-        if parts and parts[0] == "raphael":
-            parts.pop(0)
+def remove_stale_strm_files(output_root, generated_files):
+    removed = 0
+    for path in output_root.rglob("*.strm"):
+        if path not in generated_files:
+            path.unlink()
+            removed += 1
 
-        # Caminho relativo das pastas
-        rel_folder = Path(*parts) if parts else Path()
-        target_dir = root_dir / rel_folder
+    directories = sorted(
+        (path for path in output_root.rglob("*") if path.is_dir()),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    )
+    for directory in directories:
+        if any(directory.iterdir()):
+            continue
+        try:
+            directory.rmdir()
+        except PermissionError:
+            directory.chmod(directory.stat().st_mode | stat.S_IWRITE)
+            directory.rmdir()
+        except OSError:
+            pass
+    return removed
 
-        # Garante que a estrutura de pastas existe
-        target_dir.mkdir(parents=True, exist_ok=True)
 
-        # Troca extensão original da mídia para .strm
-        stem_name = Path(name).stem
-        strm_filename = f"{stem_name}.strm"
-        strm_file_path = target_dir / strm_filename
+def generate_strm_files(
+    *,
+    mongo_url=None,
+    database=None,
+    output_root=None,
+    stream_base_url=None,
+    library_user=None,
+    prune=False,
+):
+    client = MongoClient(mongo_url or mongo_uri)
+    db = client[database or os.getenv("MONGO_DATABASE", "ftp")]
+    output_root = Path(output_root or os.getenv("STRM_OUTPUT_DIR", root_dir)).resolve()
+    base_url = (stream_base_url or f"http://{host}:{port}").rstrip("/")
+    library_user = library_user or os.getenv("NEBULA_LIBRARY_USER", "raphael")
+    generated_files = set()
+    removed_count = 0
 
-        # Escreve o arquivo .strm com a URL de streaming
-        strm_file_path.write_text(stream_url, encoding="utf-8")
-        created_count += 1
+    try:
+        completed_files = list(db.files.find({"type": "file", "status": "completed", "parts.0": {"$exists": True}}))
+        for doc in completed_files:
+            name = str(doc.get("name", ""))
+            parts = list(PurePosixPath(str(doc.get("parent", ""))).parts)
+            if parts and parts[0] == "/":
+                parts.pop(0)
+            if not parts or parts.pop(0) != library_user:
+                continue
 
-    client.close()
+            target_dir = output_root / Path(*(safe_windows_name(part) for part in parts))
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target = target_dir / f"{safe_windows_name(Path(name).stem)}.strm"
+            temp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+            try:
+                temp.write_text(
+                    f"{base_url}/{stream_endpoint(name)}?id={doc['_id']}",
+                    encoding="utf-8",
+                )
+                temp.replace(target)
+            finally:
+                temp.unlink(missing_ok=True)
+            generated_files.add(target)
 
-    print("=== GERAÇÃO STRM CONCLUÍDA ===")
-    print(f"Estrutura criada em: {root_dir}")
-    print(f"Total de arquivos .strm gerados: {created_count}")
+        if prune:
+            removed_count = remove_stale_strm_files(output_root, generated_files)
+    finally:
+        client.close()
+
+    result = {
+        "generated": len(generated_files),
+        "removed": removed_count,
+        "output": str(output_root),
+    }
+    print(
+        f"STRM concluido: gerados={result['generated']} removidos={result['removed']} "
+        f"saida={result['output']}"
+    )
+    return result
+
 
 if __name__ == "__main__":
     generate_strm_files()

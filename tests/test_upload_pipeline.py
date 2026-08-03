@@ -57,6 +57,9 @@ sys.modules["pyrogram.utils"] = _fake_pyrogram_utils
 sys.modules["motor"] = MagicMock()
 sys.modules["motor.motor_asyncio"] = MagicMock()
 sys.modules["pymongo"] = MagicMock()
+_fake_pymongo_errors = MagicMock()
+_fake_pymongo_errors.DuplicateKeyError = type("DuplicateKeyError", (Exception,), {})
+sys.modules["pymongo.errors"] = _fake_pymongo_errors
 
 # Stub tools.check_deps so ensure_runtime_dependencies is a no-op
 _fake_check_deps = MagicMock()
@@ -97,6 +100,106 @@ _readahead_producer = main_mod._readahead_producer
 # 1. Bot rotation tests
 # ===========================================================================
 
+@pytest.mark.asyncio
+async def test_global_upload_concurrency_limit(monkeypatch):
+    monkeypatch.setattr(main_mod, "UPLOAD_CONCURRENCY", 2)
+    main_mod._UPLOAD_SEMAPHORE = None
+    main_mod._UPLOAD_SEMAPHORE_LOOP = None
+    active = 0
+    peak = 0
+
+    async def guarded_upload():
+        nonlocal active, peak
+        async with main_mod.get_upload_semaphore():
+            active += 1
+            peak = max(peak, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+
+    await asyncio.gather(*(guarded_upload() for _ in range(5)))
+    assert peak == 2
+
+
+def test_worker_count_is_bounded_by_real_transmission_slots(monkeypatch):
+    monkeypatch.setattr(main_mod, "MAX_WORKERS", 24)
+    monkeypatch.setattr(main_mod, "UPLOAD_CONCURRENCY", 8)
+
+    assert main_mod.get_upload_worker_count(23) == 8
+
+
+def test_staging_path_detection(monkeypatch, tmp_path):
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    monkeypatch.setattr(main_mod, "STAGING_DIRS", [str(staging.resolve())])
+
+    assert main_mod.is_staging_path(staging / "movie.mkv") is True
+    assert main_mod.is_staging_path(tmp_path / "source" / "movie.mkv") is False
+
+
+def test_source_cleanup_ignores_legacy_global_delete(monkeypatch, tmp_path):
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    source = tmp_path / "source.mkv"
+    source.write_bytes(b"source")
+    monkeypatch.setattr(main_mod, "STAGING_DIRS", [str(staging.resolve())])
+    monkeypatch.setenv("DELETE_SOURCE_AFTER_UPLOAD", "true")
+
+    main_mod.safe_remove_staging_file(source)
+
+    assert source.exists()
+
+
+def test_resume_uses_only_contiguous_completed_parts():
+    parts = [
+        {"part_id": 0, "tg_file": "f0", "file_size": 64},
+        {"part_id": 1, "tg_file": "f1", "file_size": 64},
+        {"part_id": 3, "tg_file": "f3", "file_size": 64},
+    ]
+
+    assert [part["part_id"] for part in main_mod.get_contiguous_uploaded_parts(parts, 4)] == [0, 1]
+
+
+@pytest.mark.asyncio
+async def test_streaming_progress_callback_preempts_upload():
+    bot = MagicMock()
+    bot._nebula_streams = 1
+    state = {"preempted": False}
+
+    await main_mod._stop_upload_for_streaming(1, 2, bot, state)
+
+    assert state["preempted"] is True
+    bot.stop_transmission.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_bot_api_upload_is_cancelled_for_streaming(monkeypatch):
+    bot = MagicMock()
+    bot._nebula_bot_token = "token"
+    bot._nebula_streams = 0
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def slow_upload(*_args):
+        started.set()
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    monkeypatch.setattr(main_mod, "send_document_bot_api", slow_upload)
+    state = {"preempted": False}
+    task = asyncio.create_task(
+        main_mod._send_part_document(bot, "chat", b"data", "part.bin", state)
+    )
+    await started.wait()
+    bot._nebula_streams = 1
+
+    assert await task is None
+    assert state["preempted"] is True
+    assert cancelled.is_set()
+
+
 class TestBotRotation:
     """upload_part_with_retries should rotate bots on FloodWait."""
 
@@ -131,6 +234,27 @@ class TestBotRotation:
         bot1.send_document.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_workers_start_on_different_bots(self, tmp_path):
+        main_mod.CHUNK_SIZE = 1024
+        fpath = tmp_path / "file.bin"
+        fpath.write_bytes(b"x" * 1024)
+        bots = [_make_bot(f"bot{index}") for index in range(3)]
+        bots[1].send_document.return_value = _make_sent_msg("f1", 2)
+
+        result = await upload_part_with_retries(
+            worker_id=2,
+            bots=bots,
+            target_chat_id="chat1",
+            local_path=str(fpath),
+            file_uuid="uuid-test",
+            part_num=0,
+        )
+
+        assert result["bot_index"] == 1
+        bots[0].send_document.assert_not_awaited()
+        bots[1].send_document.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_floodwait_rotates_to_next_bot(self, tmp_path):
         """First bot FloodWait → rotate to second bot which succeeds."""
         CHUNK_SIZE = 1024
@@ -157,6 +281,30 @@ class TestBotRotation:
             )
 
         # After rotation: bot_index should be 1 (rotated from 0 → 1)
+        assert result["bot_index"] == 1
+        bot0.send_document.assert_awaited_once()
+        bot1.send_document.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_timeout_rotates_to_next_bot(self, tmp_path):
+        main_mod.CHUNK_SIZE = 1024
+        fpath = tmp_path / "file.bin"
+        fpath.write_bytes(b"x" * 1024)
+        bot0 = _make_bot("bot0")
+        bot1 = _make_bot("bot1")
+        bot0.send_document.side_effect = TimeoutError("slow upload")
+        bot1.send_document.return_value = _make_sent_msg("f1", 2)
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await upload_part_with_retries(
+                worker_id=1,
+                bots=[bot0, bot1],
+                target_chat_id="chat1",
+                local_path=str(fpath),
+                file_uuid="uuid-test",
+                part_num=0,
+            )
+
         assert result["bot_index"] == 1
         bot0.send_document.assert_awaited_once()
         bot1.send_document.assert_awaited_once()
@@ -197,10 +345,11 @@ class TestBotRotation:
         assert bot1.send_document.await_count == 1
 
     @pytest.mark.asyncio
-    async def test_initial_bot_selection_uses_modulo(self, tmp_path):
-        """Initial bot is chosen by part_num % len(bots)."""
+    async def test_parts_in_batch_start_on_adjacent_bots(self, tmp_path, monkeypatch):
+        """Parallel parts use adjacent slots reserved for their file worker."""
         CHUNK_SIZE = 1024
         main_mod.CHUNK_SIZE = CHUNK_SIZE
+        monkeypatch.setattr(main_mod, "PART_WORKERS_PER_FILE", 2)
 
         data = b"w" * 2048
         fpath = tmp_path / "file.bin"
@@ -425,6 +574,37 @@ class TestReadaheadProducer:
         assert chunks[0][1] == data[0:256]
         assert chunks[1][1] == data[256:512]
         assert chunks[2][1] == data[512:700]
+
+    @pytest.mark.asyncio
+    async def test_resume_starts_at_requested_part(self, tmp_path):
+        main_mod.CHUNK_SIZE = 4
+        data = b"aaaabbbbcccc"
+        fpath = tmp_path / "file.bin"
+        fpath.write_bytes(data)
+        queue: asyncio.Queue = asyncio.Queue()
+
+        await _readahead_producer(str(fpath), 3, queue, worker_id=1, start_part=2)
+
+        assert await queue.get() == (2, b"cccc")
+        assert await queue.get() is None
+
+    @pytest.mark.asyncio
+    async def test_resume_can_start_after_larger_existing_parts(self, tmp_path):
+        main_mod.CHUNK_SIZE = 4
+        fpath = tmp_path / "file.bin"
+        fpath.write_bytes(b"aaaabbbbcccc")
+        queue: asyncio.Queue = asyncio.Queue()
+
+        await _readahead_producer(
+            str(fpath),
+            3,
+            queue,
+            worker_id=1,
+            start_part=2,
+            start_offset=4,
+        )
+
+        assert await queue.get() == (2, b"bbbb")
 
     @pytest.mark.asyncio
     async def test_none_sentinel_at_end(self, tmp_path):

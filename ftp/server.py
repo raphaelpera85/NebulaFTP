@@ -25,7 +25,7 @@ from stat import S_ISDIR, filemode
 from time import gmtime, localtime, strftime, time
 
 from .common import StreamIO, setlocale, wrap_with_container
-from .errors import NoAvailablePort, PathIOError
+from .errors import PathIOError
 from .pathio import PathIONursery
 
 logger = logging.getLogger("NebulaFTP")
@@ -94,11 +94,11 @@ class MongoDBUserManager(AbstractUserManager):
             if u: user = u[0].update(user)
             else: self.users.append(user)
             if user.login not in self.available_connections:
-                self.available_connections[user] = AvailableConnections(100)
+                self.available_connections[user.login] = AvailableConnections(100)
         if not user: state, info = AbstractUserManager.GetUserResponse.ERROR, "no such username"
-        elif self.available_connections[user].locked(): state, info = AbstractUserManager.GetUserResponse.ERROR, f"too much connections"
+        elif self.available_connections[user.login].locked(): state, info = AbstractUserManager.GetUserResponse.ERROR, "too much connections"
         else: state, info = AbstractUserManager.GetUserResponse.PASSWORD_REQUIRED, "password required"
-        if state != AbstractUserManager.GetUserResponse.ERROR: self.available_connections[user].acquire()
+        if state != AbstractUserManager.GetUserResponse.ERROR: self.available_connections[user.login].acquire()
         return state, user, info
     async def authenticate(self, user, password):
         if not password:
@@ -119,7 +119,7 @@ class MongoDBUserManager(AbstractUserManager):
             return True
         return False
     async def notify_logout(self, user):
-        if user in self.available_connections: self.available_connections[user].release()
+        if user.login in self.available_connections: self.available_connections[user.login].release()
         self.users = [u for u in self.users if u.login != user.login]
 
 class Connection(defaultdict):
@@ -216,10 +216,14 @@ def worker(f):
     return wrapper
 
 class Server:
-    def __init__(self, user_manager, path_io):
+    def __init__(self, user_manager, path_io, passive_ports=None, security_mode="ftp"):
+        if security_mode not in {"ftp", "ftps-explicit", "ftps-implicit"}:
+            raise ValueError(f"unsupported FTP security mode: {security_mode}")
         self.path_io_factory = PathIONursery(path_io); self.user_manager = user_manager
         self.available_connections = AvailableConnections(256)
         self.ssl_context = None
+        self.passive_ports = tuple(passive_ports or ())
+        self.security_mode = security_mode
         self.commands_mapping = {
             "allo": self.allo, "auth": self.auth, "ccc": self.ccc, "abor": self.abor, "appe": self.appe, "cdup": self.cdup, "cwd": self.cwd,
             "dele": self.dele, "epsv": self.epsv, "feat": self.feat, "list": self.list, "mdtm": self.mdtm,
@@ -252,15 +256,33 @@ class Server:
         return ctx
 
     async def start(self, host="0.0.0.0", port=9021, **kwargs):
+        if self.security_mode != "ftp" and self.ssl_context is None:
+            raise RuntimeError("FTPS mode requires a valid TLS context")
         self._start_server_extra_arguments = kwargs; self.connections = {}
         self.server_host = host; self.server_port = port
-        self.server = await start_server(self.dispatcher, host, port, ssl=self.ssl_context, **kwargs)
+        implicit_tls = self.ssl_context if self.security_mode == "ftps-implicit" else None
+        self.server = await start_server(self.dispatcher, host, port, ssl=implicit_tls, **kwargs)
         for sock in self.server.sockets:
             if sock.family in (AF_INET, AF_INET6):
                 h, p, *_ = sock.getsockname()
                 if not self.server_port: self.server_port = p
 
     async def serve_forever(self): await self.server.serve_forever()
+    def stop_accepting(self): self.server.close()
+    async def _start_passive_listener(self, handler, host, protected=False):
+        data_tls = self.ssl_context if self.security_mode == "ftps-implicit" or protected else None
+        for passive_port in self.passive_ports or (0,):
+            try:
+                return await start_server(
+                    handler,
+                    host,
+                    passive_port,
+                    ssl=data_tls,
+                    **self._start_server_extra_arguments,
+                )
+            except OSError:
+                continue
+        return None
     async def run(self, host="0.0.0.0", port=9021, **kwargs):
         await self.start(host, port, **kwargs)
         try: await self.serve_forever()
@@ -271,6 +293,15 @@ class Server:
         tasks = [create_task(self.server.wait_closed())]
         for conn in self.connections.values(): conn._dispatcher.cancel(); tasks.append(conn._dispatcher)
         await wait(tasks)
+
+    async def disconnect_user(self, login):
+        tasks = []
+        for conn in list(self.connections.values()):
+            if conn.future.user.done() and conn.user.login == login:
+                conn._dispatcher.cancel()
+                tasks.append(conn._dispatcher)
+        if tasks:
+            await gather(*tasks, return_exceptions=True)
 
     # ✅ CORREÇÃO: Força Encoding UTF-8 na SAÍDA
     async def write_line(self, stream, line):
@@ -332,14 +363,18 @@ class Server:
             path_io_factory=self.path_io_factory,
             extra_workers=set(),
             response=lambda *args: queue.put_nowait(args),
-            acquired=False, restart_offset=0, _dispatcher=current_task()
+            acquired=False, restart_offset=0, _dispatcher=current_task(),
+            tls_upgraded=self.security_mode == "ftps-implicit",
+            protected=self.security_mode == "ftps-implicit",
         )
         conn.path_io = self.path_io_factory(connection=conn)
         pending = {create_task(self.greeting(conn, "")), create_task(self.response_writer(stream, queue)), create_task(self.parse_command(stream))}
+        finished = set()
         self.connections[key] = conn
         try:
             while True:
                 done, pending = await wait(pending | conn.extra_workers, return_when=FIRST_COMPLETED)
+                finished = done
                 conn.extra_workers -= done
                 for task in done:
                     try: res = task.result()
@@ -363,14 +398,15 @@ class Server:
         finally:
             tasks = []
             if not get_running_loop().is_closed():
-                for t in pending | conn.extra_workers: t.cancel(); tasks.append(t)
+                for t in pending | conn.extra_workers | finished: t.cancel(); tasks.append(t)
                 if conn.future.passive_server.done(): conn.passive_server.close()
                 if conn.future.data_connection.done(): conn.data_connection.close()
                 stream.close()
             if conn.acquired: self.available_connections.release()
             if conn.future.user.done(): tasks.append(create_task(self.user_manager.notify_logout(conn.user)))
             if key in self.connections: self.connections.pop(key)
-            if tasks: await wait(tasks)
+            if tasks:
+                await gather(*tasks, return_exceptions=True)
 
     @staticmethod
     def get_paths(connection, path):
@@ -397,6 +433,9 @@ class Server:
         conn.response(c, i); return ok
 
     async def user(self, conn, rest):
+        if self.security_mode == "ftps-explicit" and not conn.tls_upgraded:
+            conn.response("534", "AUTH TLS required before login")
+            return True
         if conn.future.user.done(): await self.user_manager.notify_logout(conn.user)
         del conn.user; del conn.logged
         state, user, info = await self.user_manager.get_user(rest)
@@ -421,7 +460,11 @@ class Server:
     async def pwd(self, conn, rest): conn.response("257", f"\"{conn.current_directory}\""); return True
 
     async def feat(self, c, r):
-        c.response("211", ["start", "UTF8", "PASV", "EPSV", "MLST Type*;Size*;Modify*;", "MDTM", "MFMT", "SIZE", "end"], True); return True
+        features = ["start", "UTF8", "PASV", "EPSV", "MLST Type*;Size*;Modify*;", "MDTM", "MFMT", "SIZE"]
+        if self.security_mode == "ftps-explicit":
+            features.extend(["AUTH TLS", "PBSZ", "PROT"])
+        features.append("end")
+        c.response("211", features, True); return True
 
     async def noop(self, c, r): c.response("200", "ok"); return True
     async def allo(self, c, r): c.response("200", "ok"); return True
@@ -580,11 +623,14 @@ class Server:
 
     async def type(self, c, r): c.response("200", "ok"); return True
     async def pbsz(self, c, r):
-        if self.ssl_context is None and not c.future.tls_upgraded.done():
+        if not c.tls_upgraded:
             c.response("503", "PBSZ not allowed without TLS")
             return True
-        c.tls_upgraded = True; c.response("200", "ok"); return True
+        c.response("200", "ok"); return True
     async def prot(self, c, r):
+        if not c.tls_upgraded:
+            c.response("503", "PROT not allowed without TLS")
+            return True
         if r.strip().upper() == "P":
             c.protected = True; c.response("200", "ok")
         elif r.strip().upper() == "C":
@@ -593,13 +639,19 @@ class Server:
             c.response("504", "only P/C accepted")
         return True
     async def auth(self, c, r):
-        if self.ssl_context is None:
+        if self.security_mode != "ftps-explicit" or self.ssl_context is None:
             c.response("431", "TLS not configured"); return True
+        if c.tls_upgraded:
+            c.response("503", "TLS already active"); return True
+        if r.strip().upper() != "TLS":
+            c.response("504", "only AUTH TLS is supported"); return True
         try:
+            await c.command_connection.write(b"234 TLS negotiation ready\r\n")
             await c.command_connection.writer.start_tls(self.ssl_context)
-            c.tls_upgraded = True; c.response("234", "TLS active")
+            c.tls_upgraded = True
         except (ssl.SSLError, ConnectionError, OSError) as exc:
-            logger.warning("AUTH TLS failed: %s", exc); c.response("431", "TLS handshake failed")
+            logger.warning("AUTH TLS failed: %s", exc)
+            return False
         return True
     async def ccc(self, c, r):
         c.protected = False; c.response("200", "ok"); return True
@@ -612,10 +664,12 @@ class Server:
             if conn.future.data_connection.done(): w.close()
             else: conn.data_connection = StreamIO(r, w)
         if not conn.future.passive_server.done():
-            try: conn.passive_server = await start_server(h, conn.server_host, 0, ssl=self.ssl_context, **self._start_server_extra_arguments)
-            except NoAvailablePort: conn.response("421", "no ports"); return False
-            except OSError as exc:
-                logger.warning("Passive server bind failed: %s", exc); conn.response("421", "no ports"); return False
+            passive_server = await self._start_passive_listener(h, conn.server_host, conn.protected)
+            if passive_server is None:
+                logger.warning("No passive port available in configured range")
+                conn.response("421", "no ports")
+                return False
+            conn.passive_server = passive_server
         
         for s in conn.passive_server.sockets:
             if s.family == AF_INET: host, port = s.getsockname(); break

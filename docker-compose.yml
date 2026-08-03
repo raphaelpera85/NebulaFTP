@@ -12,7 +12,10 @@ services:
       # Adjust the host port if you change `PORT` below.
       - "${HOST_FTP_PORT:-2121}:2121"
       # Restrict passive port range to match PASSIVE_PORTS (default 10 ports).
-      - "60000-60009:60000-60009"
+      - "${PASSIVE_PORTS:-60000-60009}:${PASSIVE_PORTS:-60000-60009}"
+      # Plugin/control and stream stay loopback-only on the Docker host.
+      - "127.0.0.1:${HOST_CONTROL_PORT:-2130}:2130"
+      - "127.0.0.1:${HOST_STREAM_PORT:-2122}:2122"
     volumes:
       - ./staging:/app/staging
       # Session file permission MUST be 0600 or the bot identity is stealable.
@@ -20,16 +23,49 @@ services:
       # path so the file is owned by the non-root container user.
       - nebula_session:/app/FTP_Bot.session:rw
       - nebula_logs:/app/nebula.log
+      - nebula_state:/app/state
+      - strm_library:/app/strm_library
       - ./.env:/app/.env:ro
     environment:
       - MONGODB=mongodb://nebula_mongo:27017
+      - MONGO_DATABASE=${MONGO_DATABASE:-ftp}
+      - API_ID=${API_ID:-}
+      - API_HASH=${API_HASH:-}
+      - BOT_TOKENS=${BOT_TOKENS:-}
+      - CHAT_ID=${CHAT_ID:-}
       - HOST=0.0.0.0
       - PORT=2121
-      - PASSIVE_PORTS=60000-60009
+      - PASSIVE_PORTS=${PASSIVE_PORTS:-60000-60009}
+      - STREAM_ONLY=${STREAM_ONLY:-false}
+      - STREAM_HOST=0.0.0.0
+      - STREAM_PORT=2122
+      - STREAM_TOKEN=${STREAM_TOKEN:?STREAM_TOKEN must contain at least 32 characters}
+      - TRANSCODE_CONCURRENCY=${TRANSCODE_CONCURRENCY:-2}
+      - STAGING_DIR=${STAGING_DIR:-staging}
+      - MAX_WORKERS=${MAX_WORKERS:-4}
+      - UPLOAD_CONCURRENCY=${UPLOAD_CONCURRENCY:-8}
+      - CHUNK_SIZE_MB=${CHUNK_SIZE_MB:-64}
+      - MAX_RETRIES=${MAX_RETRIES:-5}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - CONTROL_ENABLED=${CONTROL_ENABLED:-false}
+      - CONTROL_HOST=0.0.0.0
+      - CONTROL_PORT=2130
+      - CONTROL_TOKEN=${CONTROL_TOKEN:-}
+      - CONTROL_DRAIN_TIMEOUT=${CONTROL_DRAIN_TIMEOUT:-300}
+      - FEED_ALLOWED_ROOTS=${FEED_ALLOWED_ROOTS:-/app/staging}
+      - FEED_ALLOWED_DESTINATIONS=${FEED_ALLOWED_DESTINATIONS:-/app/staging}
+      - FEED_STATE_DIR=${FEED_STATE_DIR:-/app/state}
+      - FEED_STOP_TIMEOUT=${FEED_STOP_TIMEOUT:-15}
+      - NEBULA_LIBRARY_USER=${NEBULA_LIBRARY_USER:-raphael}
+      - STRM_OUTPUT_DIR=${STRM_OUTPUT_DIR:-/app/strm_library}
+      - STRM_OUTPUT_ROOTS=${STRM_OUTPUT_ROOTS:-/app/strm_library}
+      - PRUNE_PREVIEW_TTL=${PRUNE_PREVIEW_TTL:-300}
       # Toggle TLS by providing these two env vars (see .env.example):
       - TLS_CERTFILE=${TLS_CERTFILE:-}
       - TLS_KEYFILE=${TLS_KEYFILE:-}
       - TLS_REQUIRE_CLIENT_CERT=${TLS_REQUIRE_CLIENT_CERT:-false}
+      - TLS_REQUIRED=${TLS_REQUIRED:-false}
+      - FTP_SECURITY_MODE=${FTP_SECURITY_MODE:-ftp}
       - BCRYPT_ROUNDS=${BCRYPT_ROUNDS:-12}
       - GC_INTERVAL_SECONDS=${GC_INTERVAL_SECONDS:-60}
       - PATHIO_CACHE_MAXSIZE=${PATHIO_CACHE_MAXSIZE:-10000}
@@ -50,10 +86,7 @@ services:
     restart: unless-stopped
     networks:
       - nebula_net
-    # Bind ONLY to the bridge interface on the host; never expose by default.
-    # Remove the `ports:` block to keep Mongo fully internal.
-    ports:
-      - "127.0.0.1:27017:27017"
+    # Mongo stays internal to the Docker bridge and is never published.
     volumes:
       - mongo_data:/data/db
     environment:
@@ -80,3 +113,5 @@ volumes:
   mongo_data:
   nebula_session:
   nebula_logs:
+  nebula_state:
+  strm_library:

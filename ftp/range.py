@@ -18,6 +18,8 @@ def parse_range(value: str | None, size: int) -> tuple[int, int, int]:
     if not value or not value.startswith("bytes="):
         return 0, size - 1, 200
     spec = value[6:].strip()
+    if "," in spec:
+        return 0, size - 1, 416
     dash = spec.find("-")
     if dash == -1:
         return 0, size - 1, 200
@@ -44,7 +46,11 @@ def parse_range(value: str | None, size: int) -> tuple[int, int, int]:
                 end = int(end_text)
             except (TypeError, ValueError):
                 return 0, size - 1, 200
-    return max(0, start), min(size - 1, end), 206
+    start = max(0, start)
+    end = min(size - 1, end)
+    if size <= 0 or start >= size or end < start:
+        return 0, size - 1, 416
+    return start, end, 206
 
 
 __all__ = ("parse_range",)

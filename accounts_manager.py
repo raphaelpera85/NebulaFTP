@@ -25,7 +25,7 @@ def get_db():
     try:
         from pymongo import MongoClient
         db_uri = environ.get("MONGODB") or input("MongoDB connect string: ")
-        db = MongoClient(db_uri).ftp["users"]
+        db = MongoClient(db_uri)[environ.get("MONGO_DATABASE", "ftp")]["users"]
         return db
     except Exception as exc:
         print(f"FATAL: MongoDB unreachable: {exc}", file=sys.stderr)
@@ -86,7 +86,10 @@ def changeUserPassword(user):
     if verify_password(new_pass1, user.password_hash):
         print("A nova senha não pode ser igual à anterior")
         return
-    db.update_one({"login": user.login}, {"$set": {"password": hashed}})
+    db.update_one(
+        {"login": user.login},
+        {"$set": {"password_hash": hashed}, "$unset": {"password": ""}},
+    )
     user.password_hash = hashed
     print("Senha alterada com sucesso.")
 
@@ -148,31 +151,27 @@ def printUserData(user):
         print(f"Login: {user.login}")
         print("Password: ******** (hashed)")
         print("Actions:")
-        action = getInput(["Show password hash", "Set password", "Show permissions", "Edit permissions", "Delete user", "Back"])
+        action = getInput(["Set password", "Show permissions", "Edit permissions", "Delete user", "Back"])
         if action == 0:
-            print(f"Password hash: {user.password_hash}\nPress enter to continue...")
-            input()
-            continue
-        if action == 1:
             changeUserPassword(user)
             continue
-        elif action == 2:
+        elif action == 1:
             print("Permissions:")
             user.formatPermissions()
             print(f"Press enter to continue...")
             input()
             continue
-        elif action == 3:
+        elif action == 2:
             editPermissions(user)
             continue
-        elif action == 4:
+        elif action == 3:
             login = input(f"Enter '{user.login}' or 'delete user' to delete this user: ")
             if login != user.login and login != "delete user":
                 print("Invalid input.")
                 continue
             db.delete_one({"login": user.login})
             return
-        elif action == 5:
+        elif action == 4:
             return
 
 def showUsers():
@@ -210,7 +209,7 @@ def addUser():
         hashed = hash_password(plain)
     except ValueError as exc:
         print(f"FATAL: {exc}"); return
-    db.insert_one({"login": login, "password_hash": hashed, "password": hashed, "permissions": []})
+    db.insert_one({"login": login, "password_hash": hashed, "permissions": []})
     print(f'User "{login}" created')
 
 
@@ -223,7 +222,11 @@ def cli_set_password(args):
         print("Empty password rejected (use --password to provide non-interactively)"); sys.exit(2)
     if not db.find_one({"login": args.login}):
         print("No such user"); sys.exit(3)
-    db.update_one({"login": args.login}, {"$set": {"password": hash_password(plain), "password_hash": hash_password(plain)}})
+    hashed = hash_password(plain)
+    db.update_one(
+        {"login": args.login},
+        {"$set": {"password_hash": hashed}, "$unset": {"password": ""}},
+    )
     print(f"Password updated for {args.login}")
 
 

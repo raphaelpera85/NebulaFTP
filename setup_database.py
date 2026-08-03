@@ -29,7 +29,7 @@ async def main():
         raise SystemExit(f"FATAL: motor unavailable: {exc}") from exc
 
     client = AsyncIOMotorClient(mongo_uri)
-    db = client.ftp
+    db = client[os.getenv("MONGO_DATABASE", "ftp")]
 
     await db.files.create_index([("parent", 1), ("name", 1)], unique=True)
     await db.files.create_index("parent")

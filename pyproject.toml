@@ -1,6 +1,6 @@
 [tool.ruff]
 line-length = 110
-target-version = "py312"
+target-version = "py314"
 extend-exclude = ["staging", ".venv", "build", "dist"]
 
 [tool.ruff.lint]
@@ -18,7 +18,7 @@ ignore = [
 "ftp/server.py" = ["S104"]
 
 [tool.mypy]
-python_version = "3.12"
+python_version = "3.14"
 warn_unused_ignores = true
 warn_redundant_casts = true
 ignore_missing_imports = true
