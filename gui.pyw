@@ -70,6 +70,7 @@ class NebulaGUI:
         self.proc_server = None
         self.proc_feed = None
         self.proc_mount = None
+        self.proc_cleanup = None
         self.server_ready = threading.Event()
         self.is_running = False
         self.stream_only = False
@@ -501,7 +502,7 @@ class NebulaGUI:
 
         if active != self.turbo_active:
             self.turbo_active = active
-            for proc in (self.proc_server, self.proc_feed, self.proc_mount):
+            for proc in (self.proc_server, self.proc_feed, self.proc_mount, self.proc_cleanup):
                 self._set_process_priority(proc, active)
             if self.is_running:
                 if active:
@@ -514,7 +515,7 @@ class NebulaGUI:
                     message = f"[TURBO] Atividade detectada; prioridade normal. Reabertos: {detail}."
                 self.log(message)
         elif active:
-            for proc in (self.proc_server, self.proc_feed, self.proc_mount):
+            for proc in (self.proc_server, self.proc_feed, self.proc_mount, self.proc_cleanup):
                 self._set_process_priority(proc, True)
 
         self.root.after(5000, self._check_idle_turbo)
@@ -596,6 +597,24 @@ class NebulaGUI:
 
         threading.Thread(target=self._read_stream, args=(self.proc_server, "SERVER"), daemon=True).start()
         threading.Thread(target=self._mount_drive_when_ready, daemon=True).start()
+
+        # Inicia Bot de Limpeza de Midias Concluidas (clean_already_sent.py) - apenas em discos locais
+        cleanup_cmd = [py_exe, "-u", "tools/clean_already_sent.py", "--sources"] + sources + ["--interval", "30"]
+        try:
+            self.proc_cleanup = subprocess.Popen(
+                cleanup_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=server_env,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+            threading.Thread(target=self._read_stream, args=(self.proc_cleanup, "CLEANUP"), daemon=True).start()
+            self.log("[CLEANUP] Bot de limpeza continua ativado.")
+        except Exception as exc:
+            self.log(f"[CLEANUP] Erro ao iniciar bot de limpeza: {exc}")
 
     def _start_feed_when_ready(self, feed_cmd, runtime_env):
         while self.is_running and self.proc_server and self.proc_server.poll() is None:
@@ -689,7 +708,7 @@ class NebulaGUI:
             return
 
         self.is_running = False
-        for proc in (self.proc_server, self.proc_feed, self.proc_mount):
+        for proc in (self.proc_server, self.proc_feed, self.proc_mount, self.proc_cleanup):
             self._set_process_priority(proc, False)
         if self.turbo_closed_apps:
             self._restore_apps_after_turbo()
@@ -710,6 +729,9 @@ class NebulaGUI:
             self.proc_server.terminate()
         if self.proc_feed:
             self.proc_feed.terminate()
+        if self.proc_cleanup:
+            self.proc_cleanup.terminate()
+            self.proc_cleanup = None
 
         self.server_ready.clear()
         self.btn_start.config(state="normal")

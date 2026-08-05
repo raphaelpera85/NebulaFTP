@@ -24,6 +24,9 @@ start /b python -u main.py
 echo Starting FTP drive Z: with rclone (background)...
 powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "Start-Process powershell -ArgumentList '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File .\tools\start_rclone_z.ps1' -WindowStyle Hidden"
 
+echo Starting cleanup bot for already sent media...
+start /b python -u .\tools\clean_already_sent.py --sources "%MONITOR_PATHS%" --interval 30
+
 echo.
 echo Starting monitor and feeder for %MONITOR_PATHS%...
 python .\tools\feed_ftp.py --source "%MONITOR_PATHS%" --direct-mongo --workers 2 --watch --max-active 60 --poll-seconds 60 --delete-source --prune-completed-strm
