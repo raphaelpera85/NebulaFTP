@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 import unicodedata
@@ -8,23 +9,97 @@ import unicodedata
 from dotenv import load_dotenv
 import pymongo
 from pyrogram import Client
+from pyrogram.errors import FloodWait
 
 load_dotenv()
 
 
-def normalize_title(s: str) -> str:
-    if not s:
-        return ""
-    normalized = unicodedata.normalize("NFD", s).encode("ascii", "ignore").decode("utf-8")
-    return "".join(c for c in normalized.lower() if c.isalnum())
+def normalize_str(s: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn").lower()
+
+
+def is_hash_name(name: str) -> bool:
+    return bool(re.match(r"^[0-9a-fA-F]{20,}$", name))
+
+
+def categorize_path(orig_path: str):
+    norm = orig_path.replace("\\\\", "/").replace("\\", "/")
+    p_norm = normalize_str(norm)
+    parts_norm = [p for p in p_norm.split("/") if p]
+    orig_parts = [p for p in norm.split("/") if p]
+
+    if any(x in parts_norm for x in ["porno", "porn", "xxx", "adulto"]):
+        category = "Porno"
+        rel_parts = []
+        for i, p in enumerate(parts_norm):
+            if p in ("porno", "porn", "xxx", "adulto"):
+                rel_parts = orig_parts[i + 1 :]
+                break
+        rel = "/".join(rel_parts) if rel_parts else os.path.basename(norm)
+    elif "series" in parts_norm:
+        category = "Series"
+        rel_parts = []
+        for i, p in enumerate(parts_norm):
+            if p == "series":
+                rel_parts = orig_parts[i + 1 :]
+                break
+        rel = "/".join(rel_parts) if rel_parts else os.path.basename(norm)
+    elif "filmes" in parts_norm:
+        category = "Filmes"
+        rel_parts = []
+        for i, p in enumerate(parts_norm):
+            if p == "filmes":
+                rel_parts = orig_parts[i + 1 :]
+                break
+        rel = "/".join(rel_parts) if rel_parts else os.path.basename(norm)
+    else:
+        fname = os.path.basename(norm)
+        fn_norm = normalize_str(fname)
+        if re.search(r"\b(porno|porn|xxx|hentai|adulto)\b", fn_norm):
+            category = "Porno"
+            rel = fname
+        elif re.search(r"\bs\d{1,2}e\d{1,2}\b|season|\.s\d{2}", fn_norm):
+            category = "Series"
+            rel = fname
+        else:
+            category = "Filmes"
+            rel = fname
+
+    return category, rel
+
+
+def build_nodes_for_item(orig_path: str, user_root="/raphael"):
+    category, rel_path = categorize_path(orig_path)
+    parts = [p for p in rel_path.split("/") if p]
+    if not parts:
+        return f"{user_root}/{category}", [], os.path.basename(orig_path), category
+
+    file_name = parts[-1]
+    dir_parts = parts[:-1]
+
+    dirs_to_create = []
+    current_parent = f"{user_root}/{category}"
+
+    if not dir_parts:
+        if category == "Filmes":
+            stem = os.path.splitext(file_name)[0]
+            dirs_to_create.append((stem, current_parent))
+            current_parent = f"{current_parent}/{stem}"
+    else:
+        for d in dir_parts:
+            dirs_to_create.append((d, current_parent))
+            current_parent = f"{current_parent}/{d}"
+
+    return current_parent, dirs_to_create, file_name, category
 
 
 async def scan_bot_chunk(bot_index, token, chat_id, api_id, api_hash, start_id, end_id, obfuscated_dict, lock):
-    """Scan a specific range of message IDs using one bot worker."""
+    """Scan message range with staggered start and rate limiting."""
     app = Client(f"recon_bot_{bot_index}", api_id=api_id, api_hash=api_hash, bot_token=token, in_memory=True)
     batch_size = 100
     local_count = 0
 
+    await asyncio.sleep((bot_index - 1) * 0.1)
     try:
         async with app:
             for b_start in range(start_id, end_id, batch_size):
@@ -33,12 +108,21 @@ async def scan_bot_chunk(bot_index, token, chat_id, api_id, api_hash, start_id, 
 
                 try:
                     msgs = await app.get_messages(chat_id, batch_ids)
-                except Exception as err:
-                    await asyncio.sleep(5)
+                except FloodWait as fw:
+                    await asyncio.sleep(fw.value + 1)
                     try:
                         msgs = await app.get_messages(chat_id, batch_ids)
                     except Exception:
                         continue
+                except Exception:
+                    await asyncio.sleep(1)
+                    try:
+                        msgs = await app.get_messages(chat_id, batch_ids)
+                    except Exception:
+                        continue
+
+                if not msgs:
+                    continue
 
                 for m in msgs:
                     if m and m.document and m.document.file_name:
@@ -62,6 +146,9 @@ async def scan_bot_chunk(bot_index, token, chat_id, api_id, api_hash, start_id, 
                                 obf_entry = obfuscated_dict[obf_id]
                                 obf_entry["min_msg_id"] = min(obf_entry["min_msg_id"], m.id)
                                 obf_entry["max_msg_id"] = max(obf_entry["max_msg_id"], m.id)
+                                cap = m.caption or ""
+                                if cap and "caption" not in obf_entry:
+                                    obf_entry["caption"] = cap
 
                                 obf_entry["parts"][part_id] = {
                                     "part_id": part_id,
@@ -69,24 +156,23 @@ async def scan_bot_chunk(bot_index, token, chat_id, api_id, api_hash, start_id, 
                                     "tg_message": m.id,
                                     "file_size": m.document.file_size,
                                     "chunk_name": fname,
-                                    "bot_index": bot_index % 28,
+                                    "caption": cap,
+                                    "bot_index": (bot_index - 1) % 28,
                                 }
                                 local_count += 1
 
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(0.3)
     except Exception as exc:
         print(f"[BOT #{bot_index}] Exceção: {exc}")
 
     print(f"[BOT #{bot_index}] Concluído {start_id}..{end_id} ({local_count} peças)")
 
 
-async def scan_telegram_parallel(api_id, api_hash, bot_tokens, chat_id, total_max_id=85000):
-    """Scan Telegram channel in parallel using all 28 bots."""
+async def scan_telegram_parallel(api_id, api_hash, bot_tokens, chat_id, total_max_id=120000):
     print(f"[1/3] Varrendo canal do Telegram com {len(bot_tokens)} bots em paralelo (faixa 1..{total_max_id})...")
 
     obfuscated_dict = {}
     lock = asyncio.Lock()
-
     chunk_size = (total_max_id // len(bot_tokens)) + 1
     tasks = []
 
@@ -114,94 +200,45 @@ async def scan_telegram_parallel(api_id, api_hash, bot_tokens, chat_id, total_ma
 
 
 def restore_mongo_documents(ordered_obfuscated_list, state_items, db, user_root="/raphael"):
-    """Match ordered Telegram files with feed_ftp_state.json categorized by Filmes vs Series."""
-    print(f"\n[2/3] Organizando mídias do Telegram em Filmes e Séries...")
+    print(f"\n[2/3] Reorganizando mídias do Telegram e salvando partes de streaming no MongoDB...")
 
     now = int(time.time())
 
-    filmes_state = []
-    series_state = []
-
-    for path in state_items:
-        if path.endswith(".strm"):
+    # Filter out strm and staging hash paths
+    media_items = []
+    for x in state_items:
+        if x.endswith(".strm"):
             continue
-        if "\\Filmes\\" in path or "/Filmes/" in path:
-            filmes_state.append(path)
-        else:
-            series_state.append(path)
+        norm = x.replace("\\\\", "/").replace("\\", "/")
+        stem = os.path.splitext(os.path.basename(norm))[0]
+        if "staging/" in norm.lower() or "nebulastage/" in norm.lower() or is_hash_name(stem):
+            continue
+        media_items.append(x)
 
-    print(f" -> Mídias de Filmes no histórico: {len(filmes_state)}")
-    print(f" -> Mídias de Séries no histórico: {len(series_state)}")
+    # Ensure root category directories
+    db.files.update_one({"name": "Filmes", "parent": user_root}, {"$set": {"type": "dir", "ctime": now, "mtime": now, "size": 0}}, upsert=True)
+    db.files.update_one({"name": "Series", "parent": user_root}, {"$set": {"type": "dir", "ctime": now, "mtime": now, "size": 0}}, upsert=True)
+    db.files.update_one({"name": "Porno", "parent": user_root}, {"$set": {"type": "dir", "ctime": now, "mtime": now, "size": 0}}, upsert=True)
 
-    # Ensure root directories exist
-    db.files.update_one(
-        {"name": "Filmes", "parent": user_root},
-        {"$set": {"type": "dir", "ctime": now, "mtime": now, "size": 0}},
-        upsert=True,
-    )
-    db.files.update_one(
-        {"name": "Series", "parent": user_root},
-        {"$set": {"type": "dir", "ctime": now, "mtime": now, "size": 0}},
-        upsert=True,
-    )
-
-    restored_filmes = 0
-    restored_series = 0
-
-    categorized_state = filmes_state + series_state
+    stats = {"Filmes": 0, "Series": 0, "Porno": 0}
 
     for idx, obf in enumerate(ordered_obfuscated_list):
-        if idx >= len(categorized_state):
-            print(f"[AVISO] Fim do histórico de caminhos atingido em idx={idx}")
+        if idx >= len(media_items):
+            print(f"[AVISO] Fim da lista de mídias limpas atingido em idx={idx}")
             break
 
-        orig_path = categorized_state[idx]
+        orig_path = media_items[idx]
         file_name = os.path.basename(orig_path)
-        is_filme = idx < len(filmes_state)
+        parent_dir, dirs_to_create, _, category = build_nodes_for_item(orig_path, user_root)
 
-        if is_filme:
-            parts = orig_path.replace("/", "\\").split("\\")
-            if len(parts) >= 2 and parts[-2] not in ("Filmes", "midias"):
-                folder_name = parts[-2]
-            else:
-                folder_name = os.path.splitext(file_name)[0]
-
-            parent_dir = f"{user_root}/Filmes/{folder_name}"
-
+        for d_name, d_parent in dirs_to_create:
+            if is_hash_name(d_name):
+                continue
             db.files.update_one(
-                {"name": folder_name, "parent": f"{user_root}/Filmes"},
+                {"name": d_name, "parent": d_parent},
                 {"$set": {"type": "dir", "ctime": now, "mtime": now, "size": 0}},
                 upsert=True,
             )
-            restored_filmes += 1
-        else:
-            parts = orig_path.replace("\\", "/").split("/")
-            series_idx = -1
-            for k_idx, part in enumerate(parts):
-                if part.lower() in ("series", "séries"):
-                    series_idx = k_idx
-                    break
-
-            if series_idx != -1 and len(parts) > series_idx + 1:
-                rel_parent = "/".join(parts[series_idx + 1 : -1])
-                parent_dir = f"{user_root}/Series/{rel_parent}"
-                curr_p = f"{user_root}/Series"
-                for subf in parts[series_idx + 1 : -1]:
-                    db.files.update_one(
-                        {"name": subf, "parent": curr_p},
-                        {"$set": {"type": "dir", "ctime": now, "mtime": now, "size": 0}},
-                        upsert=True,
-                    )
-                    curr_p = f"{curr_p}/{subf}"
-            else:
-                stem = os.path.splitext(file_name)[0]
-                parent_dir = f"{user_root}/Series/{stem}"
-                db.files.update_one(
-                    {"name": stem, "parent": f"{user_root}/Series"},
-                    {"$set": {"type": "dir", "ctime": now, "mtime": now, "size": 0}},
-                    upsert=True,
-                )
-            restored_series += 1
 
         parts_dict = obf["parts"]
         sorted_part_ids = sorted(parts_dict.keys())
@@ -227,10 +264,12 @@ def restore_mongo_documents(ordered_obfuscated_list, state_items, db, user_root=
             file_doc,
             upsert=True,
         )
+        stats[category] = stats.get(category, 0) + 1
 
-    print(f"\n[3/3] Restauração concluída com sucesso!")
-    print(f" -> Filmes reindexados no Drive N: {restored_filmes}")
-    print(f" -> Séries reindexadas no Drive N: {restored_series}")
+    print(f"\n[3/3] Restauração e salvamento de rotas de streaming concluídos com sucesso!")
+    print(f" -> Filmes com streaming ativo (N:\\Filmes): {stats.get('Filmes', 0)}")
+    print(f" -> Séries com streaming ativo (N:\\Series): {stats.get('Series', 0)}")
+    print(f" -> Porno com streaming ativo (N:\\Porno): {stats.get('Porno', 0)}")
 
 
 async def main():
@@ -253,12 +292,12 @@ async def main():
     bot_tokens = [t.strip() for t in os.environ["BOT_TOKENS"].split(",") if t.strip()]
     chat_id = int(os.environ["CHAT_ID"])
 
-    print("=== Restauração Paralela de Filmes e Séries (Telegram -> MongoDB / N:) ===")
+    print("=== Restauração Completa do Telegram -> MongoDB / Drive N: ===")
     print(f"Banco MongoDB: {db_name}")
     print(f"Bots em paralelo: {len(bot_tokens)}")
-    print("=========================================================================\n")
+    print("=============================================================\n")
 
-    ordered_obfuscated_list = await scan_telegram_parallel(api_id, api_hash, bot_tokens, chat_id, total_max_id=85000)
+    ordered_obfuscated_list = await scan_telegram_parallel(api_id, api_hash, bot_tokens, chat_id, total_max_id=120000)
     restore_mongo_documents(ordered_obfuscated_list, state_items, db)
 
 

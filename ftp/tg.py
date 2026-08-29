@@ -161,7 +161,7 @@ def install_reliable_upload():
     Methods.save_file = sequential_save_file
 
 
-async def send_document_bot_api(bot, chat_id, data, file_name):
+async def send_document_bot_api(bot, chat_id, data, file_name, caption=""):
     token = getattr(bot, "_nebula_bot_token", None)
     if not isinstance(token, str) or not token:
         raise ConnectionError("Bot token unavailable for HTTPS upload")
@@ -169,6 +169,8 @@ async def send_document_bot_api(bot, chat_id, data, file_name):
     form = aiohttp.FormData()
     form.add_field("chat_id", str(chat_id))
     form.add_field("disable_notification", "true")
+    if caption:
+        form.add_field("caption", str(caption)[:1024])
     form.add_field(
         "document",
         io.BytesIO(data),
@@ -218,10 +220,38 @@ class File:
 
     def _set_id(self, id):
         self.file_id = id
-        self.id = FileId.decode(id)
-        self.loc = InputDocumentFileLocation(id=self.id.media_id, access_hash=self.id.access_hash, file_reference=self.id.file_reference, thumb_size=self.id.thumbnail_size)
+        try:
+            self.id = FileId.decode(id)
+            self.loc = InputDocumentFileLocation(
+                id=self.id.media_id,
+                access_hash=self.id.access_hash,
+                file_reference=self.id.file_reference,
+                thumb_size=self.id.thumbnail_size,
+            )
+        except Exception:
+            self.id = None
+            self.loc = None
 
     async def getChunkAt(self, offset=0, refreshed=False):
+        if not self.id or not self.loc:
+            if refreshed or not self.chat_id or not self.message_id or self.message_id <= 1:
+                return b""
+            try:
+                message = await self.client.get_messages(self.chat_id, self.message_id)
+                if not message or not message.document:
+                    return b""
+                self._set_id(message.document.file_id)
+                self.reference_refreshed = True
+                logger.info(
+                    "Referencia Telegram auto-recuperada no cliente %s para mensagem %s",
+                    getattr(self.client, "name", "?"),
+                    self.message_id,
+                )
+                return await self.getChunkAt(offset, True)
+            except Exception as exc:
+                logger.warning("Erro ao auto-recuperar mensagem %s no Telegram: %s", self.message_id, exc)
+                return b""
+
         session = await get_media_session(self.client, self.id)
         try:
             return (

@@ -1,6 +1,7 @@
 """Minimal pytest suite covering security-critical helpers."""
 from __future__ import annotations
 
+import asyncio
 import importlib
 import importlib.util
 import os
@@ -211,6 +212,117 @@ async def test_stream_marks_bot_busy_and_persists_verified_route(monkeypatch):
     updates = db.files.update_one.await_args.args[1]["$set"]
     assert updates["parts.$.bot_name"] == "bot1"
     assert updates["stream_bot_name"] == "bot1"
+
+
+@pytest.mark.asyncio
+async def test_stream_uses_free_bot_without_interrupting_upload(monkeypatch):
+    class Bot:
+        def __init__(self, name, uploads=0):
+            self.name = name
+            self._nebula_uploads = uploads
+            self._nebula_streams = 0
+
+    busy = Bot("busy", uploads=1)
+    free = Bot("free")
+
+    class FakeFile:
+        reference_refreshed = False
+        file_id = "file1"
+
+        def __init__(self, _file_id, client, **_kwargs):
+            self.client = client
+
+        async def stream(self, offset=0):
+            assert self.client is free
+            yield b"data"
+
+    monkeypatch.setattr(pathio, "File", FakeFile)
+    db = type("DB", (), {"files": type("Files", (), {"update_one": AsyncMock()})()})()
+    node = pathio.Node(
+        type="file", name="movie.mkv", size=4,
+        parts=[{"part_id": 0, "file_size": 4, "tg_file": "file1", "bot_index": 0}],
+    )
+
+    reader = pathio.MongoDBMemoryIO(node, "rb", [busy, free], db)
+    assert [chunk async for chunk in reader.iter_by_block(4)] == [b"data"]
+    assert busy._nebula_uploads == 1
+    assert busy._nebula_streams == 0
+    assert free._nebula_streams == 0
+
+
+@pytest.mark.asyncio
+async def test_stream_waits_until_an_upload_bot_is_free(monkeypatch):
+    class Bot:
+        name = "busy"
+        _nebula_uploads = 1
+        _nebula_streams = 0
+
+    bot = Bot()
+
+    class FakeFile:
+        reference_refreshed = False
+        file_id = "file1"
+
+        def __init__(self, _file_id, client, **_kwargs):
+            self.client = client
+
+        async def stream(self, offset=0):
+            yield b"data"
+
+    real_sleep = asyncio.sleep
+
+    async def release_on_wait(_delay):
+        bot._nebula_uploads = 0
+        await real_sleep(0)
+
+    monkeypatch.setattr(pathio, "File", FakeFile)
+    monkeypatch.setattr(pathio, "asleep", release_on_wait)
+    db = type("DB", (), {"files": type("Files", (), {"update_one": AsyncMock()})()})()
+    node = pathio.Node(
+        type="file", name="movie.mkv", size=4,
+        parts=[{"part_id": 0, "file_size": 4, "tg_file": "file1", "bot_index": 0}],
+    )
+
+    reader = pathio.MongoDBMemoryIO(node, "rb", [bot], db)
+    assert [chunk async for chunk in reader.iter_by_block(4)] == [b"data"]
+    assert bot._nebula_uploads == 0
+    assert bot._nebula_streams == 0
+
+
+@pytest.mark.asyncio
+async def test_stream_releases_bot_when_file_construction_fails(monkeypatch):
+    class Bot:
+        def __init__(self, name):
+            self.name = name
+            self._nebula_uploads = 0
+            self._nebula_streams = 0
+
+    broken = Bot("broken")
+    working = Bot("working")
+
+    class FakeFile:
+        reference_refreshed = False
+        file_id = "file1"
+
+        def __init__(self, _file_id, client, **_kwargs):
+            if client is broken:
+                raise ValueError("invalid file reference")
+            self.client = client
+
+        async def stream(self, offset=0):
+            yield b"data"
+
+    monkeypatch.setattr(pathio, "File", FakeFile)
+    db = type("DB", (), {"files": type("Files", (), {"update_one": AsyncMock()})()})()
+    node = pathio.Node(
+        type="file", name="movie.mkv", size=4,
+        parts=[{"part_id": 0, "file_size": 4, "tg_file": "file1", "bot_index": 0}],
+    )
+
+    reader = pathio.MongoDBMemoryIO(node, "rb", [broken, working], db)
+    with pytest.raises(ValueError, match="invalid file reference"):
+        [chunk async for chunk in reader.iter_by_block(4)]
+    assert broken._nebula_streams == 0
 
 
 def test_tls_knob_documented_in_env_example():

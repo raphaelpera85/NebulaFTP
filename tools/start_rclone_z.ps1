@@ -7,6 +7,9 @@ function Find-Rclone {
   if ($cmd) { return $cmd.Source }
   $found = Get-ChildItem "$env:LOCALAPPDATA\Microsoft\WinGet\Packages" -Filter rclone.exe -Recurse -ErrorAction SilentlyContinue |
     Select-Object -First 1 -ExpandProperty FullName
+  if (-not $found) {
+    if (Test-Path ".\tools\rclone.exe") { return (Resolve-Path ".\tools\rclone.exe").Path }
+  }
   return $found
 }
 
@@ -35,15 +38,27 @@ if (-not $rclone) {
 }
 if (-not $rclone) { throw "rclone nao encontrado apos instalacao." }
 
-if (Get-PSDrive Z -ErrorAction SilentlyContinue) {
-  $rcloneMount = Get-CimInstance Win32_Process -Filter "name = 'rclone.exe'" |
-    Where-Object { $_.CommandLine -like "*mount nebula:/ Z:*" } |
+$targetDrive = "N"
+if (Get-PSDrive N -ErrorAction SilentlyContinue) {
+  $rcloneMountN = Get-CimInstance Win32_Process -Filter "name = 'rclone.exe'" |
+    Where-Object { $_.CommandLine -like "*mount nebula:*" -and $_.CommandLine -like "*N:*" } |
     Select-Object -First 1
-  if ($rcloneMount) {
-    Write-Host "Z: ja esta montado pelo rclone."
+  if ($rcloneMountN) {
+    Write-Host "N: ja esta montado pelo rclone."
     exit 0
   }
-  throw "Z: ja esta em uso por outro programa. Desmonte o RaiDrive/outro mapeamento antes de iniciar."
+  $targetDrive = "Z"
+}
+
+if (Get-PSDrive $targetDrive -ErrorAction SilentlyContinue) {
+  $rcloneMountZ = Get-CimInstance Win32_Process -Filter "name = 'rclone.exe'" |
+    Where-Object { $_.CommandLine -like "*mount nebula:*" -and $_.CommandLine -like "*$($targetDrive):*" } |
+    Select-Object -First 1
+  if ($rcloneMountZ) {
+    Write-Host "$($targetDrive): ja esta montado pelo rclone."
+    exit 0
+  }
+  throw "$($targetDrive): ja esta em uso por outro programa. Desmonte o mapeamento existente antes de iniciar."
 }
 
 $deadline = (Get-Date).AddSeconds(60)
@@ -58,11 +73,17 @@ while ((Get-Date) -lt $deadline) {
   }
 }
 
-& $rclone mount nebula:/ Z: `
-  --config ".\rclone-nebula.conf" `
+$configFile = (Resolve-Path ".\rclone-nebula.conf").Path
+$rcloneLog = Join-Path ([System.IO.Path]::GetTempPath()) "rclone-mount.log"
+& $rclone mount nebula:/ "$($targetDrive):" `
+  --config "$configFile" `
   --vfs-cache-mode full `
   --vfs-cache-max-size 20G `
   --dir-cache-time 10s `
   --poll-interval 0 `
-  --log-file ".\rclone-mount.log" `
+  --links `
+  --no-checksum `
+  --network-mode `
+  --log-file "$rcloneLog" `
   --log-level INFO
+

@@ -39,6 +39,18 @@ def install(requirements: list[str]) -> None:
     subprocess.check_call([sys.executable, "-m", "pip", "install", *requirements])
 
 
+def ensure_default_user() -> None:
+    try:
+        from .create_default_user import main as create_user_main
+        create_user_main()
+    except Exception:
+        try:
+            from create_default_user import main as create_user_main
+            create_user_main()
+        except Exception as exc:
+            print(f"Aviso ao inicializar usuario no MongoDB: {exc}")
+
+
 def main() -> int:
     root = Path(__file__).resolve().parents[1]
     req_file = root / "requirements.txt"
@@ -46,12 +58,14 @@ def main() -> int:
         print(f"requirements.txt nao encontrado: {req_file}")
         return 2
     missing = missing_requirements(requirement_lines(req_file))
-    if not missing:
+    if missing:
+        print("Instalando dependencias Python ausentes: " + ", ".join(package_name(item) for item in missing))
+        install(missing)
+        print("Dependencias Python instaladas.")
+    else:
         print("Dependencias Python OK.")
-        return 0
-    print("Instalando dependencias Python ausentes: " + ", ".join(package_name(item) for item in missing))
-    install(missing)
-    print("Dependencias Python instaladas.")
+
+    ensure_default_user()
     return 0
 
 

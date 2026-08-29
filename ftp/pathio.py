@@ -52,18 +52,54 @@ __all__ = (
     "is_uploadable_name", "movie_folder_score", "resolve_part_bot", "resolve_part_bots",
 )
 
+def get_free_bytes(path: str) -> int:
+    """Retorna os bytes livres no disco correspondente ao caminho."""
+    try:
+        p = os.path.abspath(path)
+        while not os.path.exists(p):
+            parent = os.path.dirname(p)
+            if parent == p or not parent:
+                p = os.path.abspath(path)
+                break
+            p = parent
+        return shutil.disk_usage(p).free
+    except Exception:
+        return 0
+
+
+def get_cache_dir(required_bytes: int = 0) -> str:
+    """Retorna o diretorio de staging por ordem de prioridade/velocidade com espaco livre suficiente."""
+    if not CACHE_DIRS:
+        return os.path.abspath("staging")
+    
+    # 1. Tenta o disco mais rapido na ordem configurada (ex: E: SSD -> F: USB3 -> I:) que tenha espaco livre seguro
+    for d in CACHE_DIRS:
+        try:
+            p = os.path.abspath(d)
+            while not os.path.exists(p):
+                parent = os.path.dirname(p)
+                if parent == p or not parent:
+                    p = os.path.abspath(d)
+                    break
+                p = parent
+            usage = shutil.disk_usage(p)
+            reserve = usage.total * 10 // 100
+            min_free = max(5 * 1024**3, reserve)
+            if usage.free - (required_bytes or 0) >= min_free:
+                return d
+        except Exception:
+            continue
+            
+    # 2. Fallback: Se os discos mais rapidos estiverem cheios, usa o de maior espaco livre absoluto
+    return max(CACHE_DIRS, key=get_free_bytes)
+
+
 CACHE_DIRS = [
     os.path.abspath(path.strip())
     for path in environ.get("STAGING_DIRS", environ.get("STAGING_DIR", "staging")).split(";")
     if path.strip()
 ]
-CACHE_DIR = max(
-    CACHE_DIRS,
-    key=lambda path: (
-        shutil.disk_usage(os.path.dirname(path) or path).free
-        / shutil.disk_usage(os.path.dirname(path) or path).total
-    ),
-)
+CACHE_DIR = get_cache_dir()
 UPLOADABLE_EXTENSIONS = {
     ".mkv", ".mp4", ".avi", ".mov", ".wmv", ".m4v",
     ".sub", ".ass", ".ssa", ".vtt",
@@ -76,7 +112,10 @@ MOVIE_TOKEN_NOISE = {
     "por", "para", "com", "sem", "the", "of", "and", "in", "on", "at", "to", "for", "with",
 }
 for cache_dir in CACHE_DIRS:
-    os.makedirs(cache_dir, exist_ok=True)
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+    except (OSError, ValueError):
+        pass
 
 
 def is_uploadable_name(name):
@@ -145,6 +184,25 @@ def resolve_part_bots(part, tg):
     rotated = [*tg[start:], *tg[:start]]
     candidates = [tg[index], tg[(index + 1) % len(tg)], *rotated]
     return list(dict.fromkeys(candidates))
+
+
+async def reserve_free_stream_bot(candidates):
+    """Reserve the first idle bot without interrupting active work."""
+    while candidates:
+        for bot in candidates:
+            uploads = getattr(bot, "_nebula_uploads", 0)
+            streams = getattr(bot, "_nebula_streams", 0)
+            if not isinstance(uploads, int):
+                uploads = 0
+            if not isinstance(streams, int):
+                streams = 0
+            if uploads == 0 and streams == 0:
+                # No await between the check and increment: this reservation is
+                # atomic with respect to other tasks on the asyncio event loop.
+                bot._nebula_streams = 1
+                return bot
+        await asleep(0.1)
+    return None
 
 
 class BoundedLRUCache(OrderedDict):
@@ -217,10 +275,7 @@ class MongoDBMemoryIO:
         self._node = node; self._mode = mode; self._tg = tg; self._db = db
         self.offset = 0
         self.safe_name = f"{uuid4().hex}_{node.name}"
-        cache_dir = max(
-            CACHE_DIRS,
-            key=lambda path: shutil.disk_usage(path).free / shutil.disk_usage(path).total,
-        )
+        cache_dir = get_cache_dir()
         self.local_path = os.path.join(cache_dir, self.safe_name)
 
     async def __aenter__(self): return self
@@ -312,25 +367,26 @@ class MongoDBMemoryIO:
                 logger.error("Cannot stream from Telegram: no bot clients configured")
                 return
             streamed = False
-            for tg in candidates:
-                bot_number = self._tg.index(tg) + 1 if isinstance(self._tg, (list, tuple)) else 1
-                logger.info(
-                    "[STREAM] Midia=%s parte=%s tentando Bot #%s",
-                    self._node.name,
-                    part.get("part_id"),
-                    bot_number,
-                )
-                file = File(
-                    part["tg_file"],
-                    tg,
-                    chat_id=os.environ.get("CHAT_ID"),
-                    message_id=part.get("tg_message"),
-                )
-                active_streams = getattr(tg, "_nebula_streams", 0)
-                if not isinstance(active_streams, int):
-                    active_streams = 0
-                setattr(tg, "_nebula_streams", active_streams + 1)
+            remaining_candidates = list(candidates)
+            while remaining_candidates:
+                tg = await reserve_free_stream_bot(remaining_candidates)
+                if tg is None:
+                    break
                 try:
+                    remaining_candidates.remove(tg)
+                    bot_number = self._tg.index(tg) + 1 if isinstance(self._tg, (list, tuple)) else 1
+                    logger.info(
+                        "[STREAM] Midia=%s parte=%s tentando Bot #%s",
+                        self._node.name,
+                        part.get("part_id"),
+                        bot_number,
+                    )
+                    file = File(
+                        part["tg_file"],
+                        tg,
+                        chat_id=os.environ.get("CHAT_ID"),
+                        message_id=part.get("tg_message"),
+                    )
                     async for chunk in file.stream(offset=local_offset):
                         if not streamed:
                             bot_name = getattr(tg, "name", None)
@@ -374,7 +430,7 @@ class MongoDBMemoryIO:
                         streamed = True
                         yield chunk
                 finally:
-                    setattr(tg, "_nebula_streams", max(0, getattr(tg, "_nebula_streams", 1) - 1))
+                    tg._nebula_streams = max(0, getattr(tg, "_nebula_streams", 1) - 1)
                 if streamed:
                     break
                 logger.warning(
