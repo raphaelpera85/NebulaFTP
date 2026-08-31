@@ -49,7 +49,7 @@ Cliente FTP envia → Disco local (instantâneo) → Telegram (background)
 *FileZilla transferindo 15GB de filmes*
 
 ![RaiDrive montado](docs/images/screenshot_raidrive.png)
-*Drive Z: montado no Windows Explorer*
+*Drive N: montado no Windows Explorer*
 
 </details>
 

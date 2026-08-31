@@ -39,7 +39,7 @@ if (-not $rclone) {
 if (-not $rclone) { throw "rclone nao encontrado apos instalacao." }
 
 $targetDrive = "N"
-if (Get-PSDrive N -ErrorAction SilentlyContinue) {
+if (Get-PSDrive $targetDrive -ErrorAction SilentlyContinue) {
   $rcloneMountN = Get-CimInstance Win32_Process -Filter "name = 'rclone.exe'" |
     Where-Object { $_.CommandLine -like "*mount nebula:*" -and $_.CommandLine -like "*N:*" } |
     Select-Object -First 1
@@ -47,18 +47,7 @@ if (Get-PSDrive N -ErrorAction SilentlyContinue) {
     Write-Host "N: ja esta montado pelo rclone."
     exit 0
   }
-  $targetDrive = "Z"
-}
-
-if (Get-PSDrive $targetDrive -ErrorAction SilentlyContinue) {
-  $rcloneMountZ = Get-CimInstance Win32_Process -Filter "name = 'rclone.exe'" |
-    Where-Object { $_.CommandLine -like "*mount nebula:*" -and $_.CommandLine -like "*$($targetDrive):*" } |
-    Select-Object -First 1
-  if ($rcloneMountZ) {
-    Write-Host "$($targetDrive): ja esta montado pelo rclone."
-    exit 0
-  }
-  throw "$($targetDrive): ja esta em uso por outro programa. Desmonte o mapeamento existente antes de iniciar."
+  throw "N: ja esta em uso por outro programa. Desmonte o mapeamento existente antes de iniciar."
 }
 
 $deadline = (Get-Date).AddSeconds(60)
@@ -86,4 +75,3 @@ $rcloneLog = Join-Path ([System.IO.Path]::GetTempPath()) "rclone-mount.log"
   --network-mode `
   --log-file "$rcloneLog" `
   --log-level INFO
-

@@ -34,6 +34,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
 _INSTANCE_MUTEX = None
 
 
@@ -69,7 +71,7 @@ def find_rclone_exe() -> str | None:
             if matches:
                 return matches[0]
     for candidate in [
-        os.path.abspath(os.path.join("tools", "rclone.exe")),
+        os.path.join(APP_DIR, "tools", "rclone.exe"),
         r"C:\Program Files\rclone\rclone.exe",
         os.path.expanduser(r"~\rclone\rclone.exe"),
     ]:
@@ -1076,7 +1078,7 @@ class NebulaGUI:
         if os.path.exists("N:\\"):
             self.root.after(0, self.log, "Unidade N: já está montada.")
             return
-        config_path = os.path.abspath("rclone-nebula.conf")
+        config_path = os.path.join(APP_DIR, "rclone-nebula.conf")
         cmd = [
             rclone, "mount", "nebula:/", "N:",
             "--config", config_path,
@@ -1084,14 +1086,18 @@ class NebulaGUI:
             "--vfs-cache-max-size", "20G",
             "--dir-cache-time", "30s",
             "--poll-interval", "0",
+            "--links",
+            "--no-checksum",
+            "--network-mode",
             "--volname", "NebulaFTP",
-            "--log-file", os.path.abspath("rclone-mount.log"),
+            "--log-file", os.path.join(APP_DIR, "rclone-mount.log"),
             "--log-level", "INFO",
         ]
         self.proc_mount = subprocess.Popen(
             cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            cwd=APP_DIR,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
         for _ in range(30):
