@@ -132,11 +132,15 @@ while ((Get-Date) -lt $deadline) {
 }
 
 $configFile = (Resolve-Path ".\rclone-nebula.conf").Path
+$rcloneLog = Join-Path ([System.IO.Path]::GetTempPath()) "rclone-mount.log"
 & $rclone mount nebula:/ "$($targetDrive):" `
   --config "$configFile" `
   --vfs-cache-mode full `
   --vfs-cache-max-size 20G `
   --dir-cache-time 10s `
   --poll-interval 0 `
-  --log-file ".\rclone-mount.log" `
+  --links `
+  --no-checksum `
+  --network-mode `
+  --log-file "$rcloneLog" `
   --log-level INFO

@@ -156,6 +156,8 @@ def get_upload_worker_count(bot_count):
 def next_upload_bot_index(bot_count):
     """Return a process-wide round-robin start index for the next upload part."""
     global UPLOAD_BOT_CURSOR
+    if bot_count == 0:
+        return 0
     index = UPLOAD_BOT_CURSOR % bot_count
     UPLOAD_BOT_CURSOR = (UPLOAD_BOT_CURSOR + 1) % bot_count
     return index
@@ -301,8 +303,6 @@ FEED_STATE_DIR = Path(
 FEED_STOP_TIMEOUT = max(1, int(environ.get("FEED_STOP_TIMEOUT", "15")))
 
 # --- CONTROLE DE LOCKS (PROTEÇÃO) ---
-# Conjunto para armazenar caminhos de arquivos que estão sendo enviados agora.
-# O Garbage Collector NÃO pode tocar nestes arquivos.
 ACTIVE_UPLOADS = set()
 
 
@@ -393,6 +393,7 @@ def _search_key(value):
 
 STAGING_SAFE_NAME_RE = re.compile(r"^[0-9a-f]{32}_.+")
 
+
 class SafeStreamHandler(logging.StreamHandler):
     def emit(self, record):
         try:
@@ -442,34 +443,81 @@ class CompactingFileHandler(RotatingFileHandler):
         if progress_lines:
             summary.append(f"- ultimo progresso: {progress_lines[-1]}")
         summary.extend(["", "### Ultimas 20 linhas antes da limpeza", "```text", *tail, "```", ""])
-        with open(self.context_file, "a", encoding="utf-8", errors="replace") as fh:
-            fh.write("\n".join(summary))
+        try:
+            with open(self.context_file, "a", encoding="utf-8", errors="replace") as fh:
+                fh.write("\n".join(summary))
+        except Exception:
+            pass
         if self.stream:
-            self.stream.flush()
-            self.stream.seek(0)
-            self.stream.truncate()
+            try:
+                self.stream.flush()
+                self.stream.seek(0)
+                self.stream.truncate()
+            except Exception:
+                pass
         self.line_count = 0
         self.recent_lines.clear()
 
 
+def _get_writable_file_path(filename: str) -> str:
+    try:
+        p = Path(filename)
+        if p.is_absolute():
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with open(p, "a", encoding="utf-8") as f:
+                pass
+            return str(p)
+        with open(filename, "a", encoding="utf-8") as f:
+            pass
+        return filename
+    except Exception:
+        pass
+
+    for base in [
+        os.environ.get("PROGRAMDATA"),
+        os.environ.get("LOCALAPPDATA"),
+        os.environ.get("APPDATA"),
+        os.environ.get("TEMP"),
+    ]:
+        if not base:
+            continue
+        try:
+            target_dir = Path(base) / "Mulletaflix" / "nebula"
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target_path = target_dir / Path(filename).name
+            with open(target_path, "a", encoding="utf-8") as f:
+                pass
+            return str(target_path)
+        except Exception:
+            continue
+    return filename
+
+
 # --- LOGGING ---
 log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-log_handler = CompactingFileHandler(
-    'nebula.log',
-    compact_lines=LOG_COMPACT_LINES,
-    context_file=LOG_CONTEXT_FILE,
-    maxBytes=LOG_MAX_SIZE*1024*1024,
-    backupCount=LOG_BACKUP_COUNT,
-    encoding="utf-8",
-    errors="replace",
-)
-log_handler.setFormatter(log_formatter)
 console_handler = SafeStreamHandler()
 console_handler.setFormatter(log_formatter)
 logger = logging.getLogger("NebulaFTP")
 logger.setLevel(getattr(logging, LOG_LEVEL.upper(), logging.INFO))
-logger.addHandler(log_handler)
 logger.addHandler(console_handler)
+
+try:
+    log_target = _get_writable_file_path(environ.get("LOG_FILE", "nebula.log"))
+    context_target = _get_writable_file_path(LOG_CONTEXT_FILE)
+    log_handler = CompactingFileHandler(
+        log_target,
+        compact_lines=LOG_COMPACT_LINES,
+        context_file=context_target,
+        maxBytes=LOG_MAX_SIZE*1024*1024,
+        backupCount=LOG_BACKUP_COUNT,
+        encoding="utf-8",
+        errors="replace",
+    )
+    log_handler.setFormatter(log_formatter)
+    logger.addHandler(log_handler)
+except Exception as log_err:
+    logger.warning("Log em arquivo desabilitado devido a permissoes: %s", log_err)
+
 
 # --- MÉTRICAS ---
 class Metrics:
@@ -482,6 +530,7 @@ class Metrics:
     def report(cls):
         mb = cls.bytes_uploaded / (1024*1024)
         logger.debug(f"Stats runtime: enviados={cls.uploads_total} volume={mb:.2f} MB falhas={cls.uploads_failed}")
+
 
 async def log_queue_state(mongo, event):
     try:
@@ -519,6 +568,7 @@ async def log_queue_state(mongo, event):
         )
     except Exception as exc:
         logger.warning("Fila: falha ao calcular status: %s", exc)
+
 
 EPISODE_RE = re.compile(r"(?i)(?P<prefix>.*?)(?:[.\s_-]+)?s(?P<season>\d{1,2})e(?P<episode>\d{1,3})")
 
@@ -633,6 +683,7 @@ async def resolve_media_parent(mongo, parent, filename):
     logger.info("Roteando vídeo para nova pasta do filme: %s -> %s", filename, routed)
     return routed
 
+
 async def stats_reporter(mongo):
     while True:
         try:
@@ -649,10 +700,7 @@ async def stats_reporter(mongo):
                             continue
                         fp = os.path.join(root, f)
 
-                        if not os.path.isfile(fp):
-                            continue
-
-                        # Ignora se j? estiver sendo enviado (evita duplicar na fila)
+                        # Ignora se já estiver sendo enviado (evita duplicar na fila)
                         if fp in ACTIVE_UPLOADS:
                             continue
 
@@ -1087,6 +1135,8 @@ async def upload_part_with_retries(worker_id, bots, target_chat_id, local_path, 
 
     # Rotate globally so successive media parts do not keep concentrating
     # traffic on the same worker-specific subset of bots.
+    if not bots:
+        raise RuntimeError("Nenhum bot Telegram disponível para upload. Verifique os tokens configurados.")
     current_bot_idx = next_upload_bot_index(len(bots))
     sent_msg = None
     attempt = 1
@@ -2015,7 +2065,13 @@ async def main():
     except RuntimeError as exc:
         logger.critical(str(exc))
         return 1
-
+    # Sessions ficam em diretório gravável fora do Program Files
+    _sessions_dir = Path(
+        environ.get("SESSIONS_DIR",
+            str(Path.home() / ".nebulaftp" / "sessions")
+        )
+    )
+    _sessions_dir.mkdir(parents=True, exist_ok=True)
     bots = [
         Client(
             f"Nebula_Bot_{idx + 1}",
@@ -2025,6 +2081,7 @@ async def main():
             no_updates=True,
             workers=1,
             max_concurrent_transmissions=1,
+            workdir=str(_sessions_dir),
         )
         for idx, token in enumerate(tokens)
     ]

@@ -34,6 +34,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
 _INSTANCE_MUTEX = None
 
 
@@ -59,10 +61,30 @@ def get_python_exe() -> str:
 def find_rclone_exe() -> str | None:
     try:
         from tools.rclone_installer import find_rclone
-        return find_rclone()
+        exe = find_rclone()
+        if exe:
+            return exe
     except Exception:
-        return shutil.which("rclone") or shutil.which("rclone.exe")
-
+        pass
+    exe = shutil.which("rclone") or shutil.which("rclone.exe")
+    if exe:
+        return exe
+    local_appdata = os.environ.get("LOCALAPPDATA", "")
+    if local_appdata:
+        winget_pkg = os.path.join(local_appdata, "Microsoft", "WinGet", "Packages")
+        if os.path.isdir(winget_pkg):
+            import glob
+            matches = glob.glob(os.path.join(winget_pkg, "**", "rclone.exe"), recursive=True)
+            if matches:
+                return matches[0]
+    for candidate in [
+        os.path.join(APP_DIR, "tools", "rclone.exe"),
+        r"C:\Program Files\rclone\rclone.exe",
+        os.path.expanduser(r"~\rclone\rclone.exe"),
+    ]:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
 
 
 
@@ -1053,8 +1075,10 @@ class NebulaGUI:
             )
         except Exception as exc:
             self.root.after(0, self.log, f"[RCLONE] Erro ao preparar rclone/WinFsp: {exc}")
-            return
-
+            rclone = find_rclone_exe()
+            if not rclone:
+                self.root.after(0, self.log, "rclone não encontrado; unidade N: não montada.")
+                return
         for _ in range(180):
             if not self.is_running:
                 return
@@ -1069,8 +1093,7 @@ class NebulaGUI:
         if os.path.exists("N:\\"):
             self.root.after(0, self.log, "Unidade N: já está montada.")
             return
-        config_path = os.path.abspath("rclone-nebula.conf")
-
+        config_path = os.path.join(APP_DIR, "rclone-nebula.conf")
         cmd = [
             rclone, "mount", "nebula:/", "N:",
             "--config", config_path,
@@ -1078,14 +1101,18 @@ class NebulaGUI:
             "--vfs-cache-max-size", "20G",
             "--dir-cache-time", "30s",
             "--poll-interval", "0",
+            "--links",
+            "--no-checksum",
+            "--network-mode",
             "--volname", "NebulaFTP",
-            "--log-file", os.path.abspath("rclone-mount.log"),
+            "--log-file", os.path.join(APP_DIR, "rclone-mount.log"),
             "--log-level", "INFO",
         ]
         self.proc_mount = subprocess.Popen(
             cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            cwd=APP_DIR,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
         for _ in range(30):
@@ -1295,6 +1322,13 @@ class NebulaGUI:
         self.server_ready.clear()
         if self.proc_mount and self.proc_mount.poll() is None:
             self.proc_mount.terminate()
+        self.proc_mount = None
+        # O servidor pode falhar antes de aceitar conexões (por exemplo,
+        # WinError 10048). Não deixe o processo auxiliar continuar vivo,
+        # pois o reinício automático criaria feeders duplicados.
+        if self.proc_cleanup and self.proc_cleanup.poll() is None:
+            self.proc_cleanup.terminate()
+        self.proc_cleanup = None
         self.btn_start.config(state="normal")
         self.btn_stream.config(state="normal")
         self.btn_stop.config(state="disabled")
