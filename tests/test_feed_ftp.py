@@ -95,7 +95,7 @@ def test_cleanup_removes_only_stale_incomplete_groups(tmp_path):
     assert active_part.exists()
 
 
-def test_materialize_strm_downloads_and_deletes_placeholder(tmp_path, monkeypatch):
+def test_materialize_strm_downloads_and_preserves_placeholder(tmp_path, monkeypatch):
     src = tmp_path / "movie.strm"
     src.write_text("https://example.com/media/movie.mp4\n", encoding="utf-8")
 
@@ -110,7 +110,7 @@ def test_materialize_strm_downloads_and_deletes_placeholder(tmp_path, monkeypatc
 
     assert target == tmp_path / "movie.mp4"
     assert target.read_bytes() == b"media-bytes"
-    assert not src.exists()
+    assert src.exists()
 
 
 def test_materialize_strm_creates_temporary_file_in_target_stage(tmp_path, monkeypatch):
@@ -120,20 +120,61 @@ def test_materialize_strm_creates_temporary_file_in_target_stage(tmp_path, monke
     src = source / "movie.strm"
     target = stage / "movie.mp4"
     src.write_text("https://example.com/movie.mp4\n", encoding="utf-8")
-    captured = {}
-    real_mkstemp = feed_ftp.tempfile.mkstemp
+    created_in_stage = []
 
-    def capture_mkstemp(*args, **kwargs):
-        captured["dir"] = kwargs["dir"]
-        return real_mkstemp(*args, **kwargs)
+    real_open = Path.open
 
-    monkeypatch.setattr(feed_ftp.tempfile, "mkstemp", capture_mkstemp)
+    def track_open(self, *args, **kwargs):
+        if str(stage) in str(self):
+            created_in_stage.append(self)
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", track_open)
     monkeypatch.setattr(feed_ftp, "urlopen", lambda *args, **kwargs: _FakeResponse(b"media"))
 
     feed_ftp.materialize_strm(src, target=target)
 
-    assert Path(captured["dir"]) == stage
+    assert any(".movie.download" in str(p) for p in created_in_stage)
     assert target.read_bytes() == b"media"
+
+
+def test_materialize_strm_resumes_completed_parts(tmp_path, monkeypatch):
+    src = tmp_path / "movie.strm"
+    src.write_text("https://example.com/movie.mp4\n", encoding="utf-8")
+    media = bytes(range(100))  # 100 bytes, 4 parts -> 25 bytes each
+
+    # Pre-cria as partes 0, 1 e 2 já completas no disco
+    target = tmp_path / "movie.mp4"
+    tmp_base = tmp_path / ".movie.download"
+    part0 = Path(f"{tmp_base}.part0")
+    part1 = Path(f"{tmp_base}.part1")
+    part2 = Path(f"{tmp_base}.part2")
+    part0.write_bytes(media[0:25])
+    part1.write_bytes(media[25:50])
+    part2.write_bytes(media[50:75])
+
+    downloaded_ranges = []
+
+    def fake_urlopen(request, timeout=0):
+        value = request.get_header("Range")
+        if value == "bytes=0-0":
+            response = _FakeResponse(media[:1])
+            response.headers["Content-Range"] = f"bytes 0-0/{len(media)}"
+            return response
+        start, end = map(int, value.removeprefix("bytes=").split("-"))
+        downloaded_ranges.append((start, end))
+        response = _FakeResponse(media[start:end + 1])
+        response.headers["Content-Range"] = f"bytes {start}-{end}/{len(media)}"
+        return response
+
+    monkeypatch.setenv("STRM_DOWNLOAD_PARTS", "4")
+    monkeypatch.setattr(feed_ftp, "urlopen", fake_urlopen)
+
+    res = feed_ftp.materialize_strm(src, target=target)
+
+    # Apenas a parte 3 (bytes 75-99) deve ter sido baixada via HTTP!
+    assert downloaded_ranges == [(75, 99)]
+    assert res.read_bytes() == media
 
 
 def test_materialize_strm_downloads_parallel_ranges(tmp_path, monkeypatch):
@@ -196,7 +237,7 @@ def test_strm_worker_materializes_one_and_queues_upload(tmp_path, monkeypatch):
         assert src == first
         return tmp_path / "first.mp4"
 
-    def fake_enqueue_upload_job(jobs, pending, lock, source_root, dest, src):
+    def fake_enqueue_upload_job(jobs, pending, lock, source_root, dest, src, src_key=None):
         uploaded.append((source_root, dest, src))
         return True
 
@@ -229,7 +270,7 @@ def test_strm_worker_reuses_cached_link_without_redownload(tmp_path, monkeypatch
     def fail_materialize(*args, **kwargs):
         raise AssertionError("network materialization should not run for cached link")
 
-    def fake_enqueue_upload_job(jobs, pending, lock, source_root, dest, src_path):
+    def fake_enqueue_upload_job(jobs, pending, lock, source_root, dest, src_path, src_key=None):
         uploaded.append((source_root, dest, src_path))
         return True
 
@@ -290,13 +331,15 @@ def test_strm_worker_direct_mongo_uses_staging_and_virtual_destination(tmp_path,
         src_path.unlink()
         return target, "https://example.com/movie.mp4", False
 
-    def fake_enqueue(jobs, pending, lock, source_root, dest, src_path, destination=None):
+    def fake_enqueue(jobs, pending, lock, source_root, dest, src_path, destination=None, src_key=None):
         captured["source"] = src_path
         captured["destination"] = destination
         src_path.unlink()
         return True
 
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("STAGING_DIRS", raising=False)
+    monkeypatch.delenv("STAGING_DIR", raising=False)
     monkeypatch.setattr(feed_ftp, "remote_content_size", lambda url: 5)
     monkeypatch.setattr(feed_ftp, "wait_for_disk_capacity", lambda *args: None)
     monkeypatch.setattr(feed_ftp, "materialize_or_reuse_strm", fake_materialize)
@@ -316,7 +359,7 @@ def test_strm_worker_direct_mongo_uses_staging_and_virtual_destination(tmp_path,
     assert captured["destination"] == tmp_path / "virtual" / "Filmes" / "Movie (2026)" / "Movie (2026).mp4"
 
 
-def test_strm_worker_removes_strm_when_destination_was_already_sent_without_cached_url(
+def test_strm_worker_skips_strm_when_destination_was_already_sent_without_cached_url(
     tmp_path, monkeypatch
 ):
     source = tmp_path / "source"
@@ -345,7 +388,7 @@ def test_strm_worker_removes_strm_when_destination_was_already_sent_without_cach
         tmp_path / "links.json", set(), seen, None, True, "mongodb://test",
     )
 
-    assert not src.exists()
+    assert src.exists()
     assert uploads.empty()
     assert str(src) in seen
 
@@ -463,3 +506,134 @@ def test_is_completed_destination_checks_stem_match(tmp_path, monkeypatch):
 
     monkeypatch.setattr(feed_ftp, "MongoClient", lambda *a, **k: FakeClient())
     assert feed_ftp.is_completed_destination("mongodb://test", dest_root, destination)
+
+
+def test_extract_media_year():
+    assert feed_ftp.extract_media_year("Movie (2026).strm") == 2026
+    assert feed_ftp.extract_media_year("Movie.2025.1080p.mkv") == 2025
+    assert feed_ftp.extract_media_year("Blade Runner 2049 (2017).strm") == 2017
+    assert feed_ftp.extract_media_year("2012 (2009).mp4") == 2009
+    assert feed_ftp.extract_media_year("Movie - 1999.avi") == 1999
+    assert feed_ftp.extract_media_year("movie.strm", "The Matrix (1999)") == 1999
+    assert feed_ftp.extract_media_year("Movie Without Year.strm") == 0
+
+
+def test_iter_files_by_priority_orders_movies_by_year_descending(tmp_path):
+    filmes_dir = tmp_path / "Filmes"
+    filmes_dir.mkdir(parents=True)
+    
+    (filmes_dir / "Filme 2024.strm").write_text("http://example.com/2024", encoding="utf-8")
+    (filmes_dir / "Filme (2026).strm").write_text("http://example.com/2026", encoding="utf-8")
+    (filmes_dir / "Filme.2025.mkv").write_text("media", encoding="utf-8")
+    (filmes_dir / "Filme Antigo (1994).mp4").write_text("media", encoding="utf-8")
+    (filmes_dir / "Filme Sem Ano.strm").write_text("http://example.com/noyear", encoding="utf-8")
+    
+    results = list(feed_ftp.iter_files_by_priority([tmp_path], all_files=False, exclude_dirs=set()))
+    names = [src.name for _, src in results]
+    
+    assert names == [
+        "Filme (2026).strm",
+        "Filme.2025.mkv",
+        "Filme 2024.strm",
+        "Filme Antigo (1994).mp4",
+        "Filme Sem Ano.strm",
+    ]
+
+
+def test_materialize_strm_cleans_parts_on_failure_in_target_dir(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    stage = tmp_path / "stage"
+    source.mkdir()
+    stage.mkdir()
+    src = source / "broken_movie.strm"
+    src.write_text("https://example.com/broken_movie.mp4\n", encoding="utf-8")
+    target = stage / "broken_movie.mp4"
+
+    def fake_urlopen(request, timeout=0):
+        if request.get_header("Range") == "bytes=0-0":
+            res = _FakeResponse(b"x")
+            res.headers["Content-Range"] = "bytes 0-0/1000"
+            return res
+        raise IOError("Connection aborted during part download")
+
+    monkeypatch.setenv("STRM_DOWNLOAD_PARTS", "2")
+    monkeypatch.setenv("STRM_PART_RETRIES", "1")
+    monkeypatch.setattr(feed_ftp.time, "sleep", lambda _: None)
+    monkeypatch.setattr(feed_ftp, "urlopen", fake_urlopen)
+
+    import pytest
+    with pytest.raises(IOError):
+        feed_ftp.materialize_strm(src, target=target)
+
+    # Garante que nenhum arquivo temporário .download ou .part ficou no stage
+    remaining = list(stage.glob("*.download*")) + list(stage.glob(".*.download*"))
+    assert remaining == []
+
+
+def test_cleanup_stale_downloads_removes_immediate_if_media_exists(tmp_path):
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    (stage / "Movie (2026).mkv").write_bytes(b"final media content")
+    
+    # Arquivo temporário recente de uma tentativa anterior
+    stale_part = stage / ".Movie (2026).abc12345.download.part1"
+    stale_part.write_bytes(b"garbage part")
+    
+    # Como o arquivo final Movie (2026).mkv existe, deve remover mesmo que seja recente (sem esperar 1800s)
+    removed, released = feed_ftp.cleanup_stale_downloads([stage], 1800)
+    assert removed == 1
+    assert released == len(b"garbage part")
+    assert not stale_part.exists()
+    assert (stage / "Movie (2026).mkv").exists()
+
+
+def test_get_best_staging_root_prioritizes_fastest_disk_with_available_space(tmp_path, monkeypatch):
+    disk_e = tmp_path / "E_NebulaStage"
+    disk_f = tmp_path / "F_NebulaStage"
+    disk_e.mkdir()
+    disk_f.mkdir()
+
+    # Ordem de velocidade: E primeiro, F segundo
+    monkeypatch.setenv("STAGING_DIRS", f"{disk_e};{disk_f}")
+
+    def fake_disk_usage(path):
+        p_str = str(path)
+        if "E_NebulaStage" in p_str:
+            return SimpleNamespace(total=100 * 1024**3, free=60 * 1024**3)
+        if "F_NebulaStage" in p_str:
+            return SimpleNamespace(total=2000 * 1024**3, free=800 * 1024**3)
+        return SimpleNamespace(total=1000, free=100)
+
+    monkeypatch.setattr(feed_ftp.shutil, "disk_usage", fake_disk_usage)
+
+    best_root = feed_ftp.get_best_staging_root()
+    # Como Disk E é o mais rápido e possui 60 GB livres (> reserva), deve ser o escolhido
+    assert best_root == disk_e.resolve()
+
+
+def test_get_best_staging_root_falls_back_when_fastest_disk_full(tmp_path, monkeypatch):
+    disk_e = tmp_path / "E_NebulaStage"
+    disk_f = tmp_path / "F_NebulaStage"
+    disk_e.mkdir()
+    disk_f.mkdir()
+
+    monkeypatch.setenv("STAGING_DIRS", f"{disk_e};{disk_f}")
+
+    def fake_disk_usage(path):
+        p_str = str(path)
+        if "E_NebulaStage" in p_str:
+            # Disk E com apenas 1 GB livre (cheio)
+            return SimpleNamespace(total=100 * 1024**3, free=1 * 1024**3)
+        if "F_NebulaStage" in p_str:
+            return SimpleNamespace(total=2000 * 1024**3, free=800 * 1024**3)
+        return SimpleNamespace(total=1000, free=100)
+
+    monkeypatch.setattr(feed_ftp.shutil, "disk_usage", fake_disk_usage)
+
+    best_root = feed_ftp.get_best_staging_root()
+    # Como Disk E está cheio, faz fallback para Disk F
+    assert best_root == disk_f.resolve()
+
+
+
+

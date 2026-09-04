@@ -14,6 +14,7 @@ host = os.getenv("STREAM_HOST", "127.0.0.1")
 port = os.getenv("STREAM_PORT", "2122")
 root_dir = Path(__file__).resolve().parent / "strm_library"
 WINDOWS_INVALID_NAME = re.compile(r'[<>:"/\\|?*]')
+DIRECT_STREAM_EXTENSIONS = {".mp4", ".m4v", ".mov", ".webm"}
 
 
 def safe_windows_name(value):
@@ -23,7 +24,7 @@ def safe_windows_name(value):
 
 
 def stream_endpoint(name):
-    return "stream"
+    return "stream" if Path(name).suffix.lower() in DIRECT_STREAM_EXTENSIONS else "transcode"
 
 
 def remove_stale_strm_files(output_root, generated_files):
@@ -69,7 +70,12 @@ def generate_strm_files(
     removed_count = 0
 
     try:
-        completed_files = list(db.files.find({"type": "file", "status": "completed", "parts.0": {"$exists": True}}))
+        completed_files = list(
+            db.files.find(
+                {"type": "file", "status": "completed", "parts.0": {"$exists": True}},
+                {"_id": 1, "name": 1, "parent": 1},
+            )
+        )
         for doc in completed_files:
             name = str(doc.get("name", ""))
             parts = list(PurePosixPath(str(doc.get("parent", ""))).parts)

@@ -2,6 +2,13 @@
 setlocal
 cd /d "%~dp0"
 
+:: Ativa o ambiente virtual se existir
+if exist "..\.venv\Scripts\activate.bat" (
+    call "..\.venv\Scripts\activate.bat"
+) else if exist ".\.venv\Scripts\activate.bat" (
+    call ".\.venv\Scripts\activate.bat"
+)
+
 echo Checking Python dependencies...
 python .\tools\bootstrap.py
 if errorlevel 1 (

@@ -1,0 +1,61 @@
+{
+  "total_docs": 1940,
+  "verified_ok": 1935,
+  "total_problems": 5,
+  "chunk_name_mismatches": 5,
+  "duplicate_obfuscated_ids": 0,
+  "duplicate_tg_chunk_refs": 0,
+  "telegram_errors": [],
+  "problems": [
+    {
+      "type": "chunk_name_mismatch",
+      "path": "/raphael/Series/Bleach/Season 14/Bleach S14E43.mp4",
+      "obfuscated_id": "face4bf7-9d49-4314-bc83-6b00a8c4b4b6",
+      "expected_chunk_name": "face4bf7-9d49-4314-bc83-6b00a8c4b4b6.part_000",
+      "actual_tg_chunk_name": "face4bf7-9d49-4314-bc83-6b00a8c4b4b6.part_001",
+      "tg_msg_id": 15939,
+      "file_size_tg": 134217728,
+      "file_size_db": 134217728
+    },
+    {
+      "type": "chunk_name_mismatch",
+      "path": "/raphael/Series/Bleach/Season 14/Bleach S14E44.mp4",
+      "obfuscated_id": "3a476669-56b5-4e1e-b3a3-def0c4dfe309",
+      "expected_chunk_name": "3a476669-56b5-4e1e-b3a3-def0c4dfe309.part_000",
+      "actual_tg_chunk_name": "3a476669-56b5-4e1e-b3a3-def0c4dfe309.part_001",
+      "tg_msg_id": 15954,
+      "file_size_tg": 134217728,
+      "file_size_db": 268435456
+    },
+    {
+      "type": "chunk_name_mismatch",
+      "path": "/raphael/Series/Bleach/Season 15/Bleach S15E03.mp4",
+      "obfuscated_id": "f0fceaea-e3ee-45b0-a366-7911d52cd9fa",
+      "expected_chunk_name": "f0fceaea-e3ee-45b0-a366-7911d52cd9fa.part_000",
+      "actual_tg_chunk_name": "f0fceaea-e3ee-45b0-a366-7911d52cd9fa.part_001",
+      "tg_msg_id": 16030,
+      "file_size_tg": 134217728,
+      "file_size_db": 134217728
+    },
+    {
+      "type": "chunk_name_mismatch",
+      "path": "/raphael/Series/Bleach/Season 15/Bleach S15E08.mp4",
+      "obfuscated_id": "975bfcb8-dc33-4160-bb48-8ae523b2d04f",
+      "expected_chunk_name": "975bfcb8-dc33-4160-bb48-8ae523b2d04f.part_000",
+      "actual_tg_chunk_name": "975bfcb8-dc33-4160-bb48-8ae523b2d04f.part_001",
+      "tg_msg_id": 16067,
+      "file_size_tg": 134217728,
+      "file_size_db": 134217728
+    },
+    {
+      "type": "chunk_name_mismatch",
+      "path": "/raphael/Series/From/Season 02/From.S02E01.WEBRip.x264-ION10.pob.srt",
+      "obfuscated_id": "a632beae-6f29-4139-bbff-7b5c0357ba8e",
+      "expected_chunk_name": "a632beae-6f29-4139-bbff-7b5c0357ba8e.part_000",
+      "actual_tg_chunk_name": "a632beae-6f29-4139-bbff-7b5c0357ba8e.part_001",
+      "tg_msg_id": 18060,
+      "file_size_tg": 134217728,
+      "file_size_db": 268435456
+    }
+  ]
+}

@@ -1,4 +1,5 @@
 import argparse
+import contextlib
 import os
 import shutil
 import sys
@@ -9,6 +10,20 @@ from dotenv import load_dotenv
 import pymongo
 
 load_dotenv()
+
+
+def force_remove_tree(path: str) -> bool:
+    """Attempt to forcibly remove a directory tree, handling read-only files gracefully."""
+    def _onerror(func, p, _):
+        with contextlib.suppress(Exception):
+            os.chmod(p, 0o777)
+            func(p)
+
+    try:
+        shutil.rmtree(path, onerror=_onerror)
+        return not os.path.exists(path)
+    except Exception:
+        return False
 
 
 def normalize_string(s: str) -> str:
@@ -41,39 +56,55 @@ def get_completed_telegram_items(db) -> set[str]:
     return completed
 
 
+MEDIA_EXTENSIONS = {
+    ".mkv", ".mp4", ".avi", ".mov", ".wmv", ".m4v",
+    ".sub", ".ass", ".ssa", ".vtt", ".strm",
+}
+
+
+def safe_print(msg: str, file=sys.stdout):
+    try:
+        print(msg, file=file)
+    except UnicodeEncodeError:
+        encoding = getattr(file, "encoding", None) or "utf-8"
+        encoded = msg.encode(encoding, errors="replace").decode(encoding, errors="replace")
+        print(encoded, file=file)
+
+
 def clean_sources(sources: list[str], completed_items: set[str], dry_run: bool = False) -> int:
-    """Scan sources and remove files/folders already present in Telegram."""
+    """Scan sources and remove files/folders already present in Telegram or left without media files."""
     removed_count = 0
 
     for source in sources:
         # SAFETY CHECK: Never clean virtual drive N: or network drives mapped to Nebula FTP
         norm_src = os.path.normpath(source).upper()
         if norm_src.startswith("N:") or norm_src.startswith("N:\\"):
-            print(f"[SEGURANÇA] Ignorando drive virtual N: ({source}) para proteger o banco de dados.")
+            safe_print(f"[SEGURANÇA] Ignorando drive virtual N: ({source}) para proteger o banco de dados.")
             continue
 
         if not os.path.exists(source):
             continue
 
+        abs_source = os.path.abspath(source)
+
         # Walk bottom-up so child folders are processed before parents
         for root, dirs, files in os.walk(source, topdown=False):
-            if root == source:
+            abs_root = os.path.abspath(root)
+            if abs_root == abs_source:
                 continue
 
             folder_name = os.path.basename(root)
-            norm_folder = normalize_string(folder_name)
 
-            # Check if this folder itself corresponds to a completed Telegram item
-            if norm_folder and norm_folder in completed_items:
-                print(f"[REMOVER PASTA] {'(DRY-RUN) ' if dry_run else ''}Já existe no Telegram: {root}")
-                if not dry_run:
+            # Do not rmtree top category containers like Filmes/Series if directly under source
+            is_top_category = folder_name.lower() in ("filmes", "series") and os.path.dirname(abs_root) == abs_source
+
+            if is_top_category:
+                if not dry_run and os.path.exists(root) and len(os.listdir(root)) == 0:
                     try:
-                        shutil.rmtree(root)
-                        removed_count += 1
-                    except Exception as err:
-                        print(f"[ERRO] Falha ao apagar pasta {root}: {err}", file=sys.stderr)
-                else:
-                    removed_count += 1
+                        os.rmdir(root)
+                        safe_print(f"[REMOVER VAZIA] Categoria ficou vazia: {root}")
+                    except Exception:
+                        pass
                 continue
 
             # Check individual files inside the folder
@@ -83,24 +114,33 @@ def clean_sources(sources: list[str], completed_items: set[str], dry_run: bool =
 
                 if norm_stem and norm_stem in completed_items:
                     file_path = os.path.join(root, f)
-                    print(f"[REMOVER ARQUIVO] {'(DRY-RUN) ' if dry_run else ''}Já existe no Telegram: {file_path}")
+                    safe_print(f"[REMOVER ARQUIVO] {'(DRY-RUN) ' if dry_run else ''}Já existe no Telegram: {file_path}")
                     if not dry_run:
                         try:
                             os.remove(file_path)
                             removed_count += 1
                         except Exception as err:
-                            print(f"[ERRO] Falha ao apagar arquivo {file_path}: {err}", file=sys.stderr)
+                            safe_print(f"[ERRO] Falha ao apagar arquivo {file_path}: {err}", file=sys.stderr)
                     else:
                         removed_count += 1
 
-            # Remove empty directory if all files inside were deleted
-            if not dry_run and os.path.exists(root):
-                try:
-                    if len(os.listdir(root)) == 0:
-                        os.rmdir(root)
-                        print(f"[REMOVER VAZIA] Pasta ficou vazia após limpeza: {root}")
-                except Exception:
-                    pass
+            # Check if any media files remain inside this folder or its subdirectories
+            if os.path.exists(root):
+                has_media = any(
+                    os.path.splitext(f)[1].lower() in MEDIA_EXTENSIONS
+                    for r, _, fs in os.walk(root)
+                    for f in fs
+                )
+
+                if not has_media:
+                    safe_print(f"[REMOVER PASTA SEM MIDIA] {'(DRY-RUN) ' if dry_run else ''}Sem arquivos de mídia restantes: {root}")
+                    if not dry_run:
+                        if force_remove_tree(root):
+                            removed_count += 1
+                        else:
+                            safe_print(f"[AVISO] Não foi possível remover completamente: {root}", file=sys.stderr)
+                    else:
+                        removed_count += 1
 
     return removed_count
 

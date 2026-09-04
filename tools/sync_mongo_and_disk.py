@@ -25,6 +25,9 @@ def run():
         if not name.endswith(('.mkv', '.mp4', '.avi', '.mov', '.m4v')):
             continue
 
+        if parent != user_root and parent != films_root:
+            continue
+
         stem = os.path.splitext(name)[0]
         # Movie files belong in /raphael/Filmes/<stem>
         target_parent = f"{films_root}/{stem}"

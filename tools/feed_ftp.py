@@ -10,6 +10,7 @@ import os
 import queue
 import re
 import shutil
+import socket
 import tempfile
 import sys
 import threading
@@ -36,6 +37,9 @@ INCOMPLETE_RE = re.compile(
     r"(?i)(?P<download>.+\.download)(?:\.part\d+)?$|.+\.(?:partial|crdownload|aria2|tmp)$"
 )
 
+# Priority order for category processing
+CATEGORY_PRIORITY = ["filmes", "porno", "series"]
+
 
 @dataclass
 class Stats:
@@ -51,6 +55,86 @@ def is_monitored(path: Path) -> bool:
     if suffix in {".download", ".partial"}:
         return False
     return suffix in MONITORED_EXTENSIONS
+
+
+def extract_media_year(name: str, parent_name: str = "") -> int:
+    """Extrai o ano da midia (1900-2099) a partir do nome do arquivo e/ou pasta."""
+    for text in (name, parent_name):
+        if not text:
+            continue
+        bracket_matches = re.findall(r"[\(\[]\s*((?:19|20)\d{2})\s*[\)\]]", text)
+        if bracket_matches:
+            return int(bracket_matches[-1])
+        delim_matches = re.findall(r"(?:^|[.\s_\-\(\[])((?:19|20)\d{2})(?:$|[.\s_\-\)\]])", text)
+        if delim_matches:
+            return int(delim_matches[-1])
+        word_matches = re.findall(r"\b((?:19|20)\d{2})\b", text)
+        if word_matches:
+            return int(word_matches[-1])
+    return 0
+
+
+def get_category_from_path(src: Path, source_root: Path) -> str | None:
+    """Extract category (filmes/porno/series) from file path relative to source root."""
+    try:
+        rel = src.relative_to(source_root)
+        parts = [p.lower() for p in rel.parts]
+        for p in parts:
+            if any(k in p for k in ["filme", "movie"]):
+                return "filmes"
+            if any(k in p for k in ["porno", "porn", "xxx", "hentai", "adulto"]):
+                return "porno"
+            if any(k in p for k in ["serie", "tv", "show", "anime", "season"]):
+                return "series"
+    except ValueError:
+        pass
+    src_str = str(src).lower()
+    if any(k in src_str for k in ["\\filmes\\", "/filmes/", "filme"]):
+        return "filmes"
+    if any(k in src_str for k in ["\\porno\\", "/porno/", "porn", "xxx", "adulto"]):
+        return "porno"
+    if any(k in src_str for k in ["\\series\\", "/series/", "serie", "season"]):
+        return "series"
+    return None
+
+
+def iter_files_by_priority(sources: list[Path], all_files: bool, exclude_dirs: set[str]):
+    """Yield files grouped by priority: Filmes (ano decrescente: 2026 -> 2025 -> ...) -> Porno -> Series."""
+    # Collect all files first with their category
+    categorized: dict[str, list[tuple[Path, Path]]] = {cat: [] for cat in CATEGORY_PRIORITY}
+    categorized["other"] = []
+    
+    for source in sources:
+        for root, _, files in os.walk(source):
+            root_path = Path(root)
+            rel_parts = root_path.relative_to(source).parts
+            if rel_parts and rel_parts[0].lower() in exclude_dirs:
+                continue
+            for name in files:
+                src = root_path / name
+                if src.suffix.lower() in {".download", ".partial"}:
+                    continue
+                if all_files or is_monitored(src):
+                    cat = get_category_from_path(src, source)
+                    if cat and cat in CATEGORY_PRIORITY:
+                        categorized[cat].append((source, src))
+                    else:
+                        categorized["other"].append((source, src))
+    
+    # Ordenar filmes por ano da midia em ordem decrescente (ex: 2026 -> 2025 -> 2024 -> ...)
+    categorized["filmes"].sort(
+        key=lambda item: (
+            -extract_media_year(item[1].name, item[1].parent.name),
+            item[1].name.lower()
+        )
+    )
+
+    # Yield in priority order
+    for cat in CATEGORY_PRIORITY:
+        for item in categorized[cat]:
+            yield item
+    for item in categorized["other"]:
+        yield item
 
 
 def split_source_paths(raw_sources: list[str] | None) -> list[Path]:
@@ -90,6 +174,8 @@ def cleanup_stale_downloads(sources: list[Path], max_age_seconds: int = 1800) ->
     cutoff = time.time() - max_age_seconds
     groups: dict[tuple[Path, str], list[Path]] = {}
     for source in sources:
+        if not source.exists():
+            continue
         for root, _, files in os.walk(source):
             parent = Path(root)
             for name in files:
@@ -101,16 +187,29 @@ def cleanup_stale_downloads(sources: list[Path], max_age_seconds: int = 1800) ->
 
     removed = 0
     released = 0
-    for paths in groups.values():
+    for (parent, key), paths in groups.items():
+        has_completed_media = False
+        sample_name = paths[0].name
+        clean_name = sample_name.lstrip(".")
+        stem_guess = clean_name.split(".download")[0]
+        if "." in stem_guess:
+            stem_parts = stem_guess.rsplit(".", 1)
+            if len(stem_parts) == 2 and len(stem_parts[1]) >= 4:
+                stem_guess = stem_parts[0]
+        for ext in UPLOADABLE_EXTENSIONS:
+            if (parent / f"{stem_guess}{ext}").exists():
+                has_completed_media = True
+                break
+
         try:
-            if max(path.stat().st_mtime for path in paths) >= cutoff:
+            if not has_completed_media and max(path.stat().st_mtime for path in paths) >= cutoff:
                 continue
         except FileNotFoundError:
             continue
         for path in paths:
             try:
                 released += path.stat().st_size
-                path.unlink()
+                path.unlink(missing_ok=True)
                 removed += 1
             except FileNotFoundError:
                 pass
@@ -205,6 +304,52 @@ def remote_content_size(url: str) -> int | None:
         return int(length) if length and response.status != 206 else None
 
 
+def get_free_bytes(path: Path | str) -> int:
+    """Retorna os bytes livres no disco correspondente ao caminho."""
+    try:
+        p = Path(path).resolve()
+        while not p.exists() and p.parent != p:
+            p = p.parent
+        return shutil.disk_usage(p).free
+    except Exception:
+        return 0
+
+
+def get_best_staging_root(
+    stage_roots: list[Path] | None = None,
+    required_bytes: int | None = None,
+) -> Path:
+    """Retorna o diretorio raiz de staging por ordem de prioridade/velocidade com espaco livre suficiente."""
+    if not stage_roots:
+        stage_dirs = os.getenv("STAGING_DIRS", os.getenv("STAGING_DIR", "staging"))
+        stage_roots = [
+            Path(p.strip()).resolve()
+            for p in stage_dirs.split(";")
+            if p.strip()
+        ]
+    if not stage_roots:
+        return Path("staging").resolve()
+
+    min_free_percent = min(max(int(os.getenv("STRM_MIN_FREE_PERCENT", "10")), 1), 90)
+
+    # 1. Tenta o disco mais rapido na ordem configurada (ex: E: SSD -> F: USB3 -> I:) que tenha espaco livre seguro
+    for root in stage_roots:
+        try:
+            p = root
+            while not p.exists() and p.parent != p:
+                p = p.parent
+            usage = shutil.disk_usage(p)
+            reserve = usage.total * min_free_percent // 100
+            min_free = max(5 * 1024**3, reserve)  # Minimo de 5GB ou percentual de reserva
+            if usage.free - (required_bytes or 0) >= min_free:
+                return root
+        except Exception:
+            continue
+
+    # 2. Fallback: Se os discos mais rapidos estiverem cheios, usa o de maior espaco livre absoluto
+    return max(stage_roots, key=get_free_bytes)
+
+
 def wait_for_disk_capacity(target: Path, required_bytes: int | None, minimum_free_percent: int = 10) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     last_notice = 0.0
@@ -233,15 +378,21 @@ def materialize_strm(src: Path, overwrite: bool = False, target: Path | None = N
     target = target or src.with_name(f"{src.stem}{guess_media_extension(url)}")
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists() and not overwrite:
-        src.unlink(missing_ok=True)
+        for old_temp in target.parent.glob(f".{src.stem}.*.download*"):
+            with contextlib.suppress(Exception):
+                old_temp.unlink(missing_ok=True)
+        for old_temp in target.parent.glob(f".{src.stem}.download*"):
+            with contextlib.suppress(Exception):
+                old_temp.unlink(missing_ok=True)
         return target
 
-    fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=f".{src.stem}.", suffix=".download")
-    os.close(fd)
-    tmp_path = Path(tmp_name)
+    read_timeout = max(5, int(os.getenv("STRM_READ_TIMEOUT", "20")))
+    socket.setdefaulttimeout(read_timeout)
+    tmp_path = target.parent / f".{src.stem}.download"
+    part_paths: list[Path] = []
     try:
         probe = Request(url, headers={"Range": "bytes=0-0", "User-Agent": "Mozilla/5.0"})
-        with urlopen(probe, timeout=30) as response:
+        with urlopen(probe, timeout=read_timeout) as response:
             content_range = response.headers.get("Content-Range", "")
             match = re.match(r"bytes\s+0-0/(\d+)", content_range)
             if not match:
@@ -254,42 +405,97 @@ def materialize_strm(src: Path, overwrite: bool = False, target: Path | None = N
                 part_size = (total + parts_count - 1) // parts_count
                 part_paths = [Path(f"{tmp_path}.part{index}") for index in range(parts_count)]
                 progress_lock = threading.Lock()
-                progress = {"downloaded": 0, "next": 5}
+                progress = {"downloaded": 0, "next_percent": 1, "last_logged_bytes": 0}
+
+                # Verificar partes existentes válidas para retomada (Resume)
+                for index, p_path in enumerate(part_paths):
+                    start = index * part_size
+                    end = min(start + part_size, total) - 1
+                    expected = end - start + 1
+                    if p_path.exists():
+                        if p_path.stat().st_size == expected:
+                            progress["downloaded"] += expected
+                        else:
+                            p_path.unlink(missing_ok=True)
+
+                if progress["downloaded"] > 0:
+                    percent = int(progress["downloaded"] * 100 / total)
+                    print(
+                        f"[STRM] Resumindo {src.name}: {progress['downloaded'] / 1024 / 1024:.1f} MB "
+                        f"de {total / 1024 / 1024:.1f} MB ({percent}%) ja no disco",
+                        flush=True,
+                    )
+                    progress["next_percent"] = percent + 1
+                    progress["last_logged_bytes"] = progress["downloaded"]
+
+                read_timeout = max(5, int(os.getenv("STRM_READ_TIMEOUT", "20")))
 
                 def download_part(index):
                     start = index * part_size
                     end = min(start + part_size, total) - 1
                     expected = end - start + 1
+                    part_file = part_paths[index]
+
+                    if part_file.exists() and part_file.stat().st_size == expected:
+                        print(f"[STRM] Parte {index + 1}/{parts_count} reutilizada (ja baixada)", flush=True)
+                        return
+
+                    part_file.unlink(missing_ok=True)
+                    part_tmp = Path(f"{part_file}.tmp")
+                    part_tmp.unlink(missing_ok=True)
+
                     retries = max(1, int(os.getenv("STRM_PART_RETRIES", "4")))
                     last_error = None
                     for attempt in range(1, retries + 1):
                         attempt_downloaded = 0
                         try:
+                            part_tmp.unlink(missing_ok=True)
+                            print(
+                                f"[STRM] Parte {index + 1}/{parts_count} iniciando download "
+                                f"({expected / 1024 / 1024:.1f} MB, tentativa {attempt}/{retries})...",
+                                flush=True,
+                            )
                             request = Request(url, headers={"Range": f"bytes={start}-{end}", "User-Agent": "Mozilla/5.0"})
-                            with urlopen(request, timeout=30) as part_response, part_paths[index].open("wb") as out:
-                                while chunk := part_response.read(1024 * 1024):
-                                    out.write(chunk)
-                                    attempt_downloaded += len(chunk)
-                                    with progress_lock:
-                                        progress["downloaded"] += len(chunk)
-                                        percent = int(progress["downloaded"] * 100 / total)
-                                        if percent >= progress["next"]:
-                                            print(
-                                                f"[STRM] Baixando {src.name}: {progress['downloaded'] / 1024 / 1024:.1f} MB "
-                                                f"de {total / 1024 / 1024:.1f} MB ({percent}%)",
-                                                flush=True,
-                                            )
-                                            progress["next"] = (percent // 5 + 1) * 5
-                            if part_paths[index].stat().st_size != expected:
-                                raise IOError(f"Parte {index + 1} incompleta")
+                            with urlopen(request, timeout=read_timeout) as part_response:
+                                if getattr(part_response, "status", None) and part_response.status not in (200, 206):
+                                    raise IOError(f"HTTP status {part_response.status} ao baixar parte {index + 1}")
+                                if start > 0 and getattr(part_response, "status", None) == 200:
+                                    raise IOError(f"Servidor ignorou cabecalho Range e retornou HTTP 200 para parte {index + 1}")
+                                sock = getattr(getattr(getattr(part_response, "fp", None), "raw", None), "_sock", None)
+                                if sock is not None:
+                                    with contextlib.suppress(Exception):
+                                        sock.settimeout(read_timeout)
+                                with part_tmp.open("wb") as out:
+                                    while chunk := part_response.read(64 * 1024):
+                                        out.write(chunk)
+                                        attempt_downloaded += len(chunk)
+                                        with progress_lock:
+                                            progress["downloaded"] += len(chunk)
+                                            percent = min(100, int(progress["downloaded"] * 100 / total))
+                                            bytes_since_log = progress["downloaded"] - progress["last_logged_bytes"]
+                                            if percent >= progress["next_percent"] or bytes_since_log >= 10 * 1024 * 1024:
+                                                print(
+                                                    f"[STRM] Baixando {src.name}: {progress['downloaded'] / 1024 / 1024:.1f} MB "
+                                                    f"de {total / 1024 / 1024:.1f} MB ({percent}%)",
+                                                    flush=True,
+                                                )
+                                                progress["next_percent"] = percent + 1
+                                                progress["last_logged_bytes"] = progress["downloaded"]
+                            if not part_tmp.exists() or part_tmp.stat().st_size != expected:
+                                actual = part_tmp.stat().st_size if part_tmp.exists() else 0
+                                raise IOError(f"Parte {index + 1} incompleta ({actual}/{expected} bytes)")
+                            part_tmp.replace(part_file)
                             print(f"[STRM] Parte {index + 1}/{parts_count} concluida", flush=True)
                             return
                         except Exception as exc:
                             last_error = exc
                             with progress_lock:
                                 progress["downloaded"] = max(0, progress["downloaded"] - attempt_downloaded)
-                                progress["next"] = max(5, (int(progress["downloaded"] * 100 / total) // 5 + 1) * 5)
-                            part_paths[index].unlink(missing_ok=True)
+                                percent = min(100, int(progress["downloaded"] * 100 / total))
+                                progress["next_percent"] = percent + 1
+                                progress["last_logged_bytes"] = progress["downloaded"]
+                            part_tmp.unlink(missing_ok=True)
+                            part_file.unlink(missing_ok=True)
                             print(
                                 f"[STRM] Parte {index + 1}/{parts_count} falhou "
                                 f"(tentativa {attempt}/{retries}): {exc}",
@@ -306,18 +512,28 @@ def materialize_strm(src: Path, overwrite: bool = False, target: Path | None = N
                     for part_path in part_paths:
                         with part_path.open("rb") as part:
                             shutil.copyfileobj(part, out, length=1024 * 1024)
-                        part_path.unlink()
+                        part_path.unlink(missing_ok=True)
                 if tmp_path.stat().st_size != total:
                     raise IOError("Arquivo materializado com tamanho incorreto")
         tmp_path.replace(target)
-        src.unlink(missing_ok=True)
+        for leftover in target.parent.glob(f".{src.stem}.*.download*"):
+            with contextlib.suppress(Exception):
+                leftover.unlink(missing_ok=True)
+        for leftover in target.parent.glob(f".{src.stem}.download*"):
+            with contextlib.suppress(Exception):
+                leftover.unlink(missing_ok=True)
         return target
     except Exception:
         with contextlib.suppress(FileNotFoundError):
-            tmp_path.unlink()
-        for part_path in src.parent.glob(f"{tmp_path.name}.part*"):
+            tmp_path.unlink(missing_ok=True)
+        for part_path in part_paths:
             with contextlib.suppress(FileNotFoundError):
-                part_path.unlink()
+                Path(f"{part_path}.tmp").unlink(missing_ok=True)
+            with contextlib.suppress(FileNotFoundError):
+                part_path.unlink(missing_ok=True)
+        for leftover in target.parent.glob(f"{tmp_path.name}*.tmp"):
+            with contextlib.suppress(FileNotFoundError):
+                leftover.unlink(missing_ok=True)
         raise
 
 
@@ -335,11 +551,9 @@ def materialize_or_reuse_strm(
         cached_path = Path(cached_target)
         if cached_path.exists():
             if target.exists() and not overwrite:
-                src.unlink(missing_ok=True)
                 return target, url, True
             if cached_path.resolve() != target.resolve():
                 shutil.copy2(cached_path, target)
-            src.unlink(missing_ok=True)
             return target, url, True
     if requested_target is None:
         materialized = materialize_strm(src, overwrite=overwrite)
@@ -356,8 +570,10 @@ def enqueue_upload_job(
     dest: Path,
     src: Path,
     destination: Path | None = None,
+    src_key: str | None = None,
 ) -> bool:
-    src_key = str(src)
+    if src_key is None:
+        src_key = str(src)
     with lock:
         if src_key in pending:
             return False
@@ -420,32 +636,21 @@ def strm_worker(
                 mongo_uri
                 and is_completed_destination(mongo_uri, dest_root, destination, url, src)
             ):
-                src.unlink(missing_ok=True)
                 mark_seen(src, seen, state_file)
                 print(
-                    f"[STRM][W{worker_id}] STRM duplicado/ja enviado para Telegram. Arquivo removido: {src}",
+                    f"[STRM][W{worker_id}] STRM ja concluido no Telegram. Ignorando: {src}",
                     flush=True,
                 )
                 continue
             direct_target = None
             if direct_mongo:
-                digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:24]
-                stage_roots = [
-                    Path(path.strip()).resolve()
-                    for path in os.getenv("STAGING_DIRS", os.getenv("STAGING_DIR", "staging")).split(";")
-                    if path.strip()
-                ]
-                stage_root = max(
-                    stage_roots,
-                    key=lambda path: (
-                        shutil.disk_usage(path.parent if not path.exists() else path).free
-                        / shutil.disk_usage(path.parent if not path.exists() else path).total
-                    ),
-                )
-                direct_target = stage_root / "strm" / f"{digest}{media_source.suffix}"
+                needed_size = remote_content_size(url)
+                stage_root = get_best_staging_root(required_bytes=needed_size)
+                clean_name = destination.name if destination else media_source.name
+                direct_target = stage_root / "strm" / clean_name
                 wait_for_disk_capacity(
                     direct_target,
-                    remote_content_size(url),
+                    needed_size,
                     min(max(int(os.getenv("STRM_MIN_FREE_PERCENT", "10")), 1), 90),
                 )
             materialized, url, reused = materialize_or_reuse_strm(
@@ -463,19 +668,21 @@ def strm_worker(
                 enqueue_upload_job(
                     upload_jobs, pending, lock, source_root, dest_root,
                     materialized, destination,
+                    src_key=str(src),  # Use .strm path as key to match pending
                 )
             else:
                 enqueue_upload_job(
                     upload_jobs, pending, lock, source_root, dest_root,
                     materialized,
+                    src_key=str(src),  # Use .strm path as key to match pending
                 )
         except Exception as exc:
             with lock:
                 failed_strm.add(src_key)
             print(f"[STRM][W{worker_id}] Falha ao materializar {src}: {exc}", flush=True)
         finally:
-            with lock:
-                pending.discard(src_key)
+            # Do NOT discard from pending here - let the upload worker handle it
+            # when the upload actually completes (or fails)
             strm_jobs.task_done()
 
 
@@ -549,7 +756,7 @@ def completed_destination_index(mongo_uri: str) -> tuple[set[tuple[str, str]], s
         client = MongoClient(mongo_uri, serverSelectionTimeoutMS=1000)
         try:
             for doc in mongo_database(client).files.find(
-                {"status": {"$in": ["completed", "uploading", "staging", "queued"]}},
+                {"status": "completed"},
                 {"parent": 1, "name": 1, "type": 1, "status": 1},
             ):
                 parent = str(doc.get("parent", "")).casefold()
@@ -561,54 +768,23 @@ def completed_destination_index(mongo_uri: str) -> tuple[set[tuple[str, str]], s
                 exact_set.add((parent, name_lower))
                 stem_set.add((parent, stem_lower))
 
-                if doc.get("status") == "completed":
-                    parts = [part for part in parent.split("/") if part]
-                    if "filmes" in parts:
-                        idx = parts.index("filmes")
-                        if len(parts) > idx + 1:
-                            identity = movie_identity(parts[idx + 1])
-                            if identity:
-                                movies.add(identity)
-                    elif "series" in parts:
-                        idx = parts.index("series")
-                        if len(parts) > idx + 1:
-                            identity = episode_identity(parts[idx + 1], name)
-                            if identity:
-                                episodes.add(identity)
+                parts = [part for part in parent.split("/") if part]
+                if "filmes" in parts:
+                    idx = parts.index("filmes")
+                    if len(parts) > idx + 1:
+                        identity = movie_identity(parts[idx + 1])
+                        if identity:
+                            movies.add(identity)
+                elif "series" in parts:
+                    idx = parts.index("series")
+                    if len(parts) > idx + 1:
+                        identity = episode_identity(parts[idx + 1], name)
+                        if identity:
+                            episodes.add(identity)
         finally:
             client.close()
     except Exception as exc:
         print(f"[STRM] Erro ao carregar indice do Mongo: {exc}", flush=True)
-
-    # Adiciona itens da unidade montada N: (se disponivel)
-    n_drive = Path("N:/")
-    library_root = f"/{os.getenv('NEBULA_LIBRARY_USER', 'raphael')}/filmes".casefold()
-    if n_drive.exists():
-        n_filmes = n_drive / "Filmes"
-        if n_filmes.exists() and n_filmes.is_dir():
-            try:
-                for item in n_filmes.iterdir():
-                    if item.is_dir():
-                        mid = movie_identity(item.name)
-                        if mid:
-                            movies.add(mid)
-                        exact_set.add((library_root, item.name.casefold()))
-                        stem_set.add((library_root, item.name.casefold()))
-            except Exception:
-                pass
-        n_series = n_drive / "Series"
-        if n_series.exists() and n_series.is_dir():
-            try:
-                for series_dir in n_series.iterdir():
-                    if series_dir.is_dir():
-                        for season_dir in series_dir.iterdir():
-                            if season_dir.is_dir():
-                                for ep_file in season_dir.iterdir():
-                                    epid = episode_identity(series_dir.name, ep_file.name)
-                                    if epid:
-                                        episodes.add(epid)
-            except Exception:
-                pass
 
     return exact_set, stem_set, movies, episodes
 
@@ -856,7 +1032,7 @@ def is_completed_destination(
     client = MongoClient(mongo_uri, serverSelectionTimeoutMS=3000)
     try:
         for doc in mongo_database(client).files.find(
-            {"parent": parent, "status": {"$in": ["completed", "uploading", "staging", "queued"]}},
+            {"parent": parent, "status": "completed"},
             {"name": 1},
         ):
             doc_name = str(doc.get("name", ""))
@@ -902,9 +1078,28 @@ def register_one(src: Path, dst: Path, dest_root: Path, mongo_uri: str, overwrit
     client = MongoClient(mongo_uri, serverSelectionTimeoutMS=3000)
     try:
         files = mongo_database(client).files
-        existing = files.find_one({"parent": parent, "name": dst.name}, {"status": 1, "local_path": 1})
-        if existing and not overwrite:
-            st = existing.get("status")
+        # PRIMEIRO: Busca por local_path para evitar duplicatas (ex: staging_scanner já registrou com hash name)
+        existing_by_path = files.find_one({"local_path": str(src)}, {"status": 1, "name": 1, "parent": 1})
+        if existing_by_path:
+            st = existing_by_path.get("status")
+            # Se já está completed ou em processamento, apenas atualiza delete_source
+            if st == "completed" or st in {"queued", "staging", "uploading"}:
+                files.update_one(
+                    {"_id": existing_by_path["_id"]},
+                    {"$set": {"delete_source": bool(delete_source), "name": dst.name, "parent": parent}},
+                )
+                return 0
+            # Se está em outro status (failed, etc), atualiza para queued com nome correto
+            files.update_one(
+                {"_id": existing_by_path["_id"]},
+                {"$set": {"name": dst.name, "parent": parent, "size": size, "status": "queued", "mtime": now, "delete_source": bool(delete_source)}},
+            )
+            return size
+        
+        # FALLBACK: Busca por parent+name (compatibilidade com docs antigos)
+        existing_by_name = files.find_one({"parent": parent, "name": dst.name}, {"status": 1, "local_path": 1})
+        if existing_by_name and not overwrite:
+            st = existing_by_name.get("status")
             if st == "completed" or st in {"queued", "staging", "uploading"}:
                 files.update_one(
                     {"parent": parent, "name": dst.name},
@@ -1012,6 +1207,7 @@ def worker(
     seen: set[str] | None = None,
     state_file: Path | None = None,
     delete_source: bool = False,
+    failed_strm: set[str] | None = None,
 ):
     while True:
         item = jobs.get()
@@ -1055,6 +1251,10 @@ def worker(
                     time.sleep(min(30, attempt * 3))
         with lock:
             pending.discard(src_key)
+            if not copied and failed_strm is not None:
+                # Track failed items so main loop doesn't retry immediately
+                # Use the original source path as key (could be .strm or regular file)
+                failed_strm.add(src_key)
         if copied:
             with lock:
                 done = stats.copied + stats.skipped + stats.failed
@@ -1091,6 +1291,18 @@ def main() -> int:
         action="store_true",
         help="Remove pastas/STRMs que ja constam como concluidos no Mongo.",
     )
+    parser.add_argument(
+        "--max-downloads",
+        type=int,
+        default=1,
+        help="Maximo de downloads simultaneos. Padrao: 1 (sequencial).",
+    )
+    parser.add_argument(
+        "--disk-free-threshold",
+        type=int,
+        default=30,
+        help="Percentual minimo de disco livre para iniciar downloads. Padrao: 30%%.",
+    )
     args = parser.parse_args()
 
     for stream in (sys.stdout, sys.stderr):
@@ -1115,7 +1327,7 @@ def main() -> int:
     print(f"Feeder iniciado. Monitorando origens: {', '.join(str(s) for s in sources)}", flush=True)
 
     jobs: queue.Queue[tuple[Path, Path] | None] = queue.Queue(maxsize=args.workers * 4)
-    strm_jobs: queue.Queue[tuple[Path, Path] | None] = queue.Queue(maxsize=1)
+    strm_jobs: queue.Queue[tuple[Path, Path] | None] = queue.Queue(maxsize=args.max_downloads)
     stats = Stats()
     lock = threading.Lock()
     dir_lock = threading.Lock()
@@ -1141,23 +1353,26 @@ def main() -> int:
         str(path).lower(): path
         for path in [*sources, *stage_roots]
     }.values())
+    # prune_completed_strm DESABILITADO por padrao - o bot de limpeza (clean_already_sent.py) 
+    # ja faz isso separadamente. Manter .strm no disco para o feeder poder verificar/reprocessar.
     if args.prune_completed_strm:
-        try:
-            pruned = prune_completed_strm(
-                sources,
-                mongo_uri,
-                apply=True,
-                exclude_dirs=exclude_dirs,
-                dest_root=dest,
-            )
-            print(
-                "Limpeza STRM concluida: "
-                f"analisados={pruned['scanned']} encontrados={pruned['matched']} "
-                f"pastas_removidas={pruned['folders']} strm_removidos={pruned['files']}",
-                flush=True,
-            )
-        except Exception as exc:
-            print(f"Limpeza STRM ignorada por seguranca: {exc}", flush=True)
+        print("[FEED] --prune-completed-strm desabilitado para preservar .strm no disco. Use o bot de limpeza separado.", flush=True)
+        # try:
+        #     pruned = prune_completed_strm(
+        #         sources,
+        #         mongo_uri,
+        #         apply=True,
+        #         exclude_dirs=exclude_dirs,
+        #         dest_root=dest,
+        #     )
+        #     print(
+        #         "Limpeza STRM concluida: "
+        #         f"analisados={pruned['scanned']} encontrados={pruned['matched']} "
+        #         f"pastas_removidas={pruned['folders']} strm_removidos={pruned['files']}",
+        #         flush=True,
+        #     )
+        # except Exception as exc:
+        #     print(f"Limpeza STRM ignorada por seguranca: {exc}", flush=True)
 
     threads = [
         threading.Thread(
@@ -1178,6 +1393,7 @@ def main() -> int:
                 seen,
                 state_file,
                 args.delete_source,
+                failed_strm,  # Add failed_strm for tracking failures
             ),
             daemon=True,
         )
@@ -1211,7 +1427,35 @@ def main() -> int:
     last_cleanup = 0.0
     completed_cache = None
     last_cache_update = 0.0
+    last_disk_check = 0.0
+    disk_waiting = False
+
+    def check_disk_space() -> bool:
+        """Check if staging disk has enough free space (percentage-based)."""
+        try:
+            stage_root = get_best_staging_root()
+            usage = shutil.disk_usage(stage_root)
+            free_pct = (usage.free / usage.total) * 100
+            return free_pct >= args.disk_free_threshold
+        except Exception:
+            return True  # If can't check, assume OK
+
+    def wait_for_disk_space():
+        """Wait until disk has enough free space."""
+        nonlocal disk_waiting, last_disk_check
+        if disk_waiting:
+            return
+        disk_waiting = True
+        print(f"[DISK] Espaco em disco abaixo de {args.disk_free_threshold}%. Aguardando liberacao...", flush=True)
+        while True:
+            time.sleep(args.poll_seconds)
+            if check_disk_space():
+                print(f"[DISK] Espaco liberado (>= {args.disk_free_threshold}%). Retomando downloads.", flush=True)
+                disk_waiting = False
+                break
+
     while True:
+        # Periodic cleanup
         if time.monotonic() - last_cleanup >= 600:
             stale_seconds = max(300, int(os.getenv("INCOMPLETE_MAX_AGE_SECONDS", "1800")))
             removed, released = cleanup_stale_downloads(cleanup_roots, stale_seconds)
@@ -1223,6 +1467,7 @@ def main() -> int:
                     flush=True,
                 )
 
+        # Refresh completed cache periodically
         if mongo_uri and (completed_cache is None or time.monotonic() - last_cache_update >= 300):
             try:
                 completed_cache = completed_media_identities(mongo_uri)
@@ -1230,92 +1475,125 @@ def main() -> int:
             except Exception:
                 pass
 
-        # Conta mídias pendentes físicas no disco e remove STRMs duplicados imediatamente no scan
-        all_unseen = []
+        # Check disk space periodically
+        if time.monotonic() - last_disk_check >= 30:
+            last_disk_check = time.monotonic()
+            if not check_disk_space():
+                wait_for_disk_space()
+                continue  # Re-check after waiting
+
+        # Find next file to process (priority order, one download at a time)
+        next_item = None
         try:
-            for source_root, src in iter_files(sources, args.all_files, exclude_dirs):
+            for source_root, src in iter_files_by_priority(sources, args.all_files, exclude_dirs):
                 src_key = str(src)
-                if src.suffix.lower() == ".strm":
-                    if mongo_uri:
-                        try:
-                            url = read_strm_url(src)
-                            media_src = src.with_suffix(guess_media_extension(url))
-                            dest_path = destination_for(source_root, dest, media_src)
-                            if is_completed_destination(mongo_uri, dest, dest_path, url, src, completed_cache):
-                                src.unlink(missing_ok=True)
-                                mark_seen(src, seen, state_file)
-                                print(f"[STRM] STRM duplicado/ja enviado removido: {src}", flush=True)
-                                continue
-                        except Exception:
-                            pass
-                else:
-                    if seen is not None and src_key in seen:
-                        continue
+
+                # Skip if already seen (for ALL files including .strm)
+                if seen is not None and src_key in seen:
+                    continue
+
+                # Skip if already pending or failed
                 with lock:
                     if src_key in pending or src_key in failed_strm:
                         continue
-                all_unseen.append((source_root, src))
+
+                # Check if already completed in MongoDB BEFORE downloading
+                if src.suffix.lower() == ".strm" and mongo_uri:
+                    try:
+                        url = read_strm_url(src)
+                        media_src = src.with_suffix(guess_media_extension(url))
+                        dest_path = destination_for(source_root, dest, media_src)
+                        if is_completed_destination(mongo_uri, dest, dest_path, url, src, completed_cache):
+                            mark_seen(src, seen, state_file)
+                            print(f"[STRM] Ja concluido no Mongo, pulando: {src}", flush=True)
+                            continue
+                    except Exception:
+                        pass
+                elif src.suffix.lower() != ".strm" and mongo_uri:
+                    # For regular files, check if destination already completed
+                    dest_path = destination_for(source_root, dest, src)
+                    parent = mongo_parent_for(dest, dest_path.parent)
+                    if is_completed_destination(mongo_uri, dest, dest_path, None, src, completed_cache):
+                        if seen is not None:
+                            mark_seen(src, seen, state_file)
+                        print(f"[FILE] Ja concluido no Mongo, pulando: {src}", flush=True)
+                        continue
+
+                # Check disk space before starting (for .strm downloads)
+                if src.suffix.lower() == ".strm":
+                    try:
+                        url = read_strm_url(src)
+                        size = remote_content_size(url)
+                        # Check staging disk space on the disk with the most free space
+                        stage_root = get_best_staging_root()
+                        free_bytes = get_free_bytes(stage_root)
+                        free_gb = free_bytes / (1024**3)
+                        need_gb = (size or 0) / (1024**3) * 1.1  # 10% margin
+                        if size and free_gb < need_gb:
+                            print(f"[DISK] Espaco insuficiente no melhor disco ({stage_root}): {free_gb:.1f}GB livre, precisa {need_gb:.1f}GB. Aguardando...", flush=True)
+                            time.sleep(args.poll_seconds)
+                            break  # Retry next loop
+                    except Exception:
+                        pass
+
+                # Found next item to process
+                next_item = (source_root, src)
+                break
+
         except Exception as exc:
             print(f"Erro ao escanear origem: {exc}", flush=True)
 
-        remaining_count = len(all_unseen)
-
-        # Processa jobs de STRM pendentes (mesmo se slots de upload comum estiverem cheios)
-        for source_root, src in all_unseen:
-            if src.suffix.lower() == ".strm":
-                enqueue_strm_job(strm_jobs, pending, lock, source_root, src)
+        if next_item is None:
+            # Nothing to process
+            if not args.watch:
                 break
+            time.sleep(args.poll_seconds)
+            continue
 
-        # Atualiza estatísticas no MongoDB
+        # Start processing the next item (download only, don't wait for upload)
+        source_root, src = next_item
+        src_key = str(src)
+
+        if src.suffix.lower() == ".strm":
+            if not enqueue_strm_job(strm_jobs, pending, lock, source_root, src):
+                time.sleep(2)
+                continue
+            print(f"[FEEDER] Enfileirado para download: {src}", flush=True)
+        else:
+            if not enqueue_upload_job(jobs, pending, lock, source_root, dest, src):
+                time.sleep(2)
+                continue
+            print(f"[FEEDER] Enfileirado para upload: {src}", flush=True)
+            with lock:
+                stats.queued += 1
+
+        # Update MongoDB stats
         try:
             client = MongoClient(mongo_uri, serverSelectionTimeoutMS=3000)
             mongo_database(client).stats.update_one(
                 {"_id": "feeder"},
-                {"$set": {"source": " | ".join(str(src) for src in sources), "pending_disk_files": remaining_count, "updated_at": int(time.time())}},
+                {"$set": {"source": " | ".join(str(s) for s in sources), "updated_at": int(time.time())}},
                 upsert=True
             )
             client.close()
         except Exception as e:
             print(f"Erro ao atualizar estatisticas no MongoDB: {e}", flush=True)
 
-        free_slots = args.max_active
+        # In watch mode, continue to next item immediately (download is async)
+        # The strm_worker will handle download and enqueue upload when done
         if args.watch:
-            try:
-                active = active_count(mongo_uri)
-                free_slots = max(args.max_active - active, 0)
-                snapshot = (active, free_slots, remaining_count)
-                now = time.monotonic()
-                if snapshot != last_watch_snapshot or now - last_idle_notice >= args.poll_seconds * 5:
-                    print(
-                        f"Fila Nebula: ativos={active} limite={args.max_active} livres={free_slots} | Pendentes no disco: {remaining_count}",
-                        flush=True,
-                    )
-                    last_watch_snapshot = snapshot
-                    last_idle_notice = now
-                if free_slots <= 0:
-                    time.sleep(args.poll_seconds)
-                    continue
-            except Exception as exc:
-                print(f"Nao consegui ler Mongo, aguardando: {exc}", flush=True)
-                time.sleep(args.poll_seconds)
-                continue
-
-        added = 0
-        for source_root, src in all_unseen:
-            src_key = str(src)
-            if src.suffix.lower() == ".strm":
-                continue
-            if enqueue_upload_job(jobs, pending, lock, source_root, dest, src):
-                with lock:
-                    stats.queued += 1
-                added += 1
-            if args.watch and added >= free_slots:
-                break
-
-        if not args.watch:
+            time.sleep(1)  # Brief pause to avoid tight loop
+            continue
+        else:
+            # Non-watch mode: process one and exit
             break
-        if added == 0:
-            pass
+
+    # Wait for all pending items to finish before shutting down
+    print("[FEEDER] Aguardando downloads/uploads pendentes finalizarem...", flush=True)
+    while True:
+        with lock:
+            if not pending:
+                break
         time.sleep(args.poll_seconds)
 
     for _ in threads:
