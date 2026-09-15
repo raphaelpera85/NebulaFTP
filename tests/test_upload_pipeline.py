@@ -97,12 +97,32 @@ main_mod.RPCError = FakeRPCError
 
 upload_part_with_retries = main_mod.upload_part_with_retries
 _readahead_producer = main_mod._readahead_producer
+classify_media_type = main_mod.classify_media_type
 
 
 @pytest.fixture(autouse=True)
 def reset_upload_bot_cursor():
     main_mod.UPLOAD_BOT_CURSOR = 0
     yield
+
+
+def test_classify_media_type_uses_exact_library_category():
+    assert classify_media_type(
+        "/raphael/Filmes/Temporada de Sangue (2025)",
+        "Temporada de Sangue (2025).mkv",
+    ) == "FILME"
+    assert classify_media_type(
+        "/raphael/Filmes/Series of Unfortunate Events (2025)",
+        "Series of Unfortunate Events (2025).mkv",
+    ) == "FILME"
+    assert classify_media_type(
+        "/raphael/series/Example/Season 01",
+        "Example - S01E01.mkv",
+    ) == "SERIE"
+    assert classify_media_type(
+        "/raphael/Filmes/Example",
+        "Example - S01E01.mkv",
+    ) == "SERIE"
 
 
 # ===========================================================================

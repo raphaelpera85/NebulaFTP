@@ -183,13 +183,36 @@ async def _wait_for_streaming(bot):
         active_streams = getattr(bot, "_nebula_streams", 0)
 
 
+EPISODE_FILENAME_RE = re.compile(
+    r"(?i)\b(?:s\d{1,2}[ ._-]*e\d{1,3}|\d{1,2}x\d{1,3})\b"
+)
+ADULT_FILENAME_RE = re.compile(r"(?i)\b(?:porno|porn|xxx|hentai|adulto)\b")
+
+
+def library_category(parent: str) -> str | None:
+    """Return the exact library category encoded by ``/user/<category>/...``."""
+    if not isinstance(parent, str):
+        return None
+    parts = [part for part in parent.strip("/").split("/") if part]
+    if len(parts) < 2:
+        return None
+    category = parts[1].casefold()
+    if category in {"filmes", "series", "porno"}:
+        return category
+    return None
+
+
 def classify_media_type(parent: str, filename: str) -> str:
-    """Classifica deterministicamente o tipo da mídia: 'SERIE', 'PORNO' ou 'FILME'."""
-    p_lower = (parent or "").lower()
-    f_lower = (filename or "").lower()
-    if any(x in p_lower for x in ["/porno", "porno", "porn", "xxx", "hentai", "adulto"]) or re.search(r"\b(porno|porn|xxx|hentai|adulto)\b", f_lower):
+    """Classifica deterministicamente o tipo da mídia: 'SERIE', 'PORNO' ou 'FILME'.
+
+    The library root is authoritative. Filename heuristics only promote a file
+    to a series when it contains an explicit episode identity; words such as
+    ``season`` or ``temporada`` are valid movie titles and must not be enough.
+    """
+    category = library_category(parent)
+    if category == "porno" or ADULT_FILENAME_RE.search(filename or ""):
         return "PORNO"
-    if any(x in p_lower for x in ["/series", "series"]) or re.search(r"(?i)\bS\d{1,2}[ ._-]*E\d{1,3}\b|\b\d{1,2}x\d{1,3}\b|season", f_lower):
+    if category == "series" or EPISODE_FILENAME_RE.search(filename or ""):
         return "SERIE"
     return "FILME"
 
@@ -635,7 +658,8 @@ async def resolve_media_parent(mongo, parent, filename):
 
     parts = parent.strip("/").split("/")
     user_root = f"/{parts[0]}" if parts and parts[0] else default_user_root
-    if "Series" in parts:
+    category = library_category(parent)
+    if category in {"series", "porno"}:
         return parent
 
     series_parent = series_parent_from_filename(user_root, filename)
