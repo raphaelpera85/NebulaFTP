@@ -202,7 +202,7 @@ def guess_media_extension(url: str, content_type: str | None = None) -> str:
 def remote_content_size(url: str, timeout: int = 15) -> int | None:
     """Obtém o tamanho remoto do arquivo via Range request 0-0 ou Content-Length."""
     try:
-        request = Request(url, headers={"Range": "bytes=0-0", "User-Agent": "Mozilla/5.0"})
+        request = Request(url, headers={"Range": "bytes=0-0", "User-Agent": "VLC/3.0.21 LibVLC/3.0.21"})
         with urlopen(request, timeout=timeout) as response:
             match = re.match(r"bytes\s+\d+-\d+/(\d+)", response.headers.get("Content-Range", ""))
             if match:
@@ -652,7 +652,7 @@ def download_strm_multipart(
     socket.setdefaulttimeout(read_timeout)
 
     try:
-        probe = Request(url, headers={"Range": "bytes=0-0", "User-Agent": "Mozilla/5.0"})
+        probe = Request(url, headers={"Range": "bytes=0-0", "User-Agent": "VLC/3.0.21 LibVLC/3.0.21"})
         with urlopen(probe, timeout=read_timeout) as response:
             content_range = response.headers.get("Content-Range", "")
             match = re.match(r"bytes\s+0-0/(\d+)", content_range)
@@ -717,7 +717,7 @@ def download_strm_multipart(
                             part_tmp.unlink(missing_ok=True)
                             req = Request(
                                 url,
-                                headers={"Range": f"bytes={start}-{end}", "User-Agent": "Mozilla/5.0"},
+                                headers={"Range": f"bytes={start}-{end}", "User-Agent": "VLC/3.0.21 LibVLC/3.0.21"},
                             )
                             with urlopen(req, timeout=read_timeout) as part_resp:
                                 if getattr(part_resp, "status", None) and part_resp.status not in (200, 206):

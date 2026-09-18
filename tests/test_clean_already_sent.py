@@ -62,3 +62,37 @@ def test_clean_sources_partial_series_strm_preserves_uncompleted_episodes(tmp_pa
     assert not ep1.exists()
     assert ep2.exists()
     assert season_folder.exists()
+
+
+def test_get_completed_telegram_items_handles_objectid_parent():
+    from bson import ObjectId
+
+    class FakeCollection:
+        def __init__(self, docs):
+            self.docs = docs
+
+        def find(self, query, projection=None):
+            results = []
+            for d in self.docs:
+                matches = True
+                for k, v in query.items():
+                    if d.get(k) != v:
+                        matches = False
+                        break
+                if matches:
+                    results.append(d)
+            return results
+
+    dir_id = ObjectId()
+    fake_db = type("FakeDB", (), {
+        "files": FakeCollection([
+            {"_id": dir_id, "type": "dir", "name": "Avatar (2009)"},
+            {"_id": ObjectId(), "type": "file", "status": "completed", "name": "Avatar (2009).mkv", "parent": dir_id},
+            {"_id": ObjectId(), "type": "file", "status": "completed", "name": "Matrix (1999).mp4", "parent": "/Filmes/Matrix (1999)"},
+        ])
+    })
+
+    items = clean_already_sent.get_completed_telegram_items(fake_db)
+    assert clean_already_sent.normalize_string("Avatar (2009)") in items
+    assert clean_already_sent.normalize_string("Matrix (1999)") in items
+

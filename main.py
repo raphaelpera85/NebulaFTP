@@ -380,7 +380,12 @@ def safe_remove_staging_file(path, force_delete=False):
         if not in_staging and not force_delete:
             logger.debug("source cleanup skipped outside staging: %s", path)
             return
-        os.remove(target)
+        try:
+            os.remove(target)
+        except PermissionError:
+            with contextlib.suppress(Exception):
+                os.chmod(target, 0o777)
+                os.remove(target)
         logger.info("Removido arquivo: %s", target)
         _cleanup_empty_parent_dirs(os.path.dirname(target))
     except OSError as exc:
@@ -727,6 +732,8 @@ async def stats_reporter(mongo):
                             "status": {"$in": ["queued", "uploading", "completed", "staging"]}
                         })
                         if existing_active:
+                            if existing_active.get("status") == "completed":
+                                safe_remove_staging_file(fp, force_delete=True)
                             continue
 
                         rel_dir = os.path.relpath(root, staging_dir)
@@ -833,6 +840,22 @@ async def cleanup_strm_duplicate_records(mongo):
         logger.warning("Removidos %s registros temporarios STRM duplicados.", removed)
 
 
+async def cleanup_duplicate_target_records(mongo):
+    """Remove do local e da fila todos os registros duplicados marcados como failed."""
+    removed = 0
+    async for doc in mongo.files.find(
+        {"status": "failed", "failed_reason": "duplicate_target"},
+        {"_id": 1, "name": 1, "local_path": 1, "parent": 1},
+    ):
+        local_path = doc.get("local_path")
+        if local_path and os.path.exists(local_path):
+            safe_remove_staging_file(local_path, force_delete=True)
+        await mongo.files.delete_one({"_id": doc["_id"]})
+        removed += 1
+    if removed:
+        logger.info("Removidos %s registros duplicados legados do local e da fila.", removed)
+
+
 def extract_media_year(name: str, parent_name: str = "") -> int:
     """Extrai o ano da midia (1900-2099) a partir do nome do arquivo e/ou pasta."""
     for text in (name, parent_name):
@@ -913,6 +936,7 @@ async def resolve_local_path(mongo, doc):
 
 
 async def restore_pending_uploads(mongo):
+    await cleanup_duplicate_target_records(mongo)
     count = 0
     query = {"type": "file", "status": {"$in": ["queued", "uploading", "staging"]}, "local_path": {"$exists": True}}
     pending = [doc async for doc in mongo.files.find(query)]
@@ -935,20 +959,18 @@ async def restore_pending_uploads(mongo):
                 {"_id": 1},
             )
             if duplicate:
-                await mongo.files.update_one(
-                    {"_id": doc["_id"]},
-                    {"$set": {"status": "failed", "failed_at": int(time.time()), "failed_reason": "duplicate_target"}},
-                )
-                logger.warning("Fila restaurada ignorou duplicado: %s em %s", doc["name"], parent)
+                if local_path and os.path.exists(local_path):
+                    safe_remove_staging_file(local_path, force_delete=True)
+                await mongo.files.delete_one({"_id": doc["_id"]})
+                logger.warning("Fila restaurada removeu duplicado do local e da fila: %s em %s", doc["name"], parent)
                 continue
             try:
                 await mongo.files.update_one({"_id": doc["_id"]}, {"$set": {"status": "staging", "parent": parent}})
             except DuplicateKeyError:
-                await mongo.files.update_one(
-                    {"_id": doc["_id"]},
-                    {"$set": {"status": "failed", "failed_at": int(time.time()), "failed_reason": "duplicate_target"}},
-                )
-                logger.warning("Fila restaurada encontrou duplicado concorrente: %s em %s", doc["name"], parent)
+                if local_path and os.path.exists(local_path):
+                    safe_remove_staging_file(local_path, force_delete=True)
+                await mongo.files.delete_one({"_id": doc["_id"]})
+                logger.warning("Fila restaurada encontrou duplicado concorrente e removeu do local e da fila: %s em %s", doc["name"], parent)
                 continue
             await UPLOAD_QUEUE.put({
                 "path": local_path,
@@ -991,7 +1013,24 @@ async def queued_mongo_scanner(mongo, max_workers=None):
                         logger.warning("Scanner Mongo: arquivo sem local_path valido: %s", doc.get("name"))
                         continue
                     parent = await resolve_media_parent(mongo, doc.get("parent"), doc["name"])
-                    await mongo.files.update_one({"_id": doc["_id"]}, {"$set": {"parent": parent}})
+                    duplicate = await mongo.files.find_one(
+                        {"_id": {"$ne": doc["_id"]}, "parent": parent, "name": doc["name"]},
+                        {"_id": 1},
+                    )
+                    if duplicate:
+                        if local_path and os.path.exists(local_path):
+                            safe_remove_staging_file(local_path, force_delete=True)
+                        await mongo.files.delete_one({"_id": doc["_id"]})
+                        logger.warning("Scanner Mongo: removeu duplicado do local e da fila: %s em %s", doc["name"], parent)
+                        continue
+                    try:
+                        await mongo.files.update_one({"_id": doc["_id"]}, {"$set": {"parent": parent}})
+                    except DuplicateKeyError:
+                        if local_path and os.path.exists(local_path):
+                            safe_remove_staging_file(local_path, force_delete=True)
+                        await mongo.files.delete_one({"_id": doc["_id"]})
+                        logger.warning("Scanner Mongo: duplicado concorrente removido do local e da fila: %s em %s", doc["name"], parent)
+                        continue
                     await UPLOAD_QUEUE.put({
                         "path": local_path,
                         "filename": doc["name"],
@@ -1067,8 +1106,9 @@ async def staging_scanner(mongo, staging_dirs):
 
                             if existing:
                                 st = existing.get("status")
-                                # Ja enviado e concluido no Telegram
+                                # Ja enviado e concluido no Telegram: remove do stage local
                                 if st == "completed":
+                                    safe_remove_staging_file(str(file_path), force_delete=True)
                                     continue
                                 # Em fila ou enviando: garante que o local_path atualizado aponta para onde o arquivo esta
                                 if st in ("queued", "staging", "uploading"):
@@ -1078,7 +1118,12 @@ async def staging_scanner(mongo, staging_dirs):
                                             {"$set": {"local_path": str(file_path), "size": size}},
                                         )
                                     continue
-                                # Se estava com falha (ex: local_path_missing de quando o disco F: foi desconectado), reativa para queued!
+                                # Se estava com falha por ser duplicado, apaga do disco e limpa do banco
+                                if st == "failed" and existing.get("failed_reason") == "duplicate_target":
+                                    safe_remove_staging_file(str(file_path), force_delete=True)
+                                    await mongo.files.delete_one({"_id": existing["_id"]})
+                                    continue
+                                # Se estava com outra falha (ex: local_path_missing de quando o disco F: foi desconectado), reativa para queued!
                                 await mongo.files.update_one(
                                     {"_id": existing["_id"]},
                                     {"$set": {
@@ -1106,8 +1151,12 @@ async def staging_scanner(mongo, staging_dirs):
                                 "parts": [],
                                 "delete_source": False,
                             }
-                            await mongo.files.insert_one(doc)
-                            logger.info("Stage scanner: novo arquivo detectado no stage e enfileirado: %s", inferred_name)
+                            try:
+                                await mongo.files.insert_one(doc)
+                                logger.info("Stage scanner: novo arquivo detectado no stage e enfileirado: %s", inferred_name)
+                            except DuplicateKeyError:
+                                safe_remove_staging_file(str(file_path), force_delete=True)
+                                logger.warning("Stage scanner: arquivo duplicado descartado do stage local: %s", file_path)
                         except Exception as e:
                             logger.warning("Stage scanner erro em %s: %s", file_path, e)
         except Exception as exc:
@@ -2012,6 +2061,9 @@ async def garbage_collector(mongo):
             })
             if result.deleted_count:
                 logger.info("GC: removidos %s registros falhos antigos.", result.deleted_count)
+
+            # Limpa duplicados marcados como failed e apaga arquivos locais
+            await cleanup_duplicate_target_records(mongo)
 
             # Remove staging records whose local_path no longer exists
             stale_staging = [

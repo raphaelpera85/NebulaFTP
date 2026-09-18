@@ -119,11 +119,21 @@ if (Get-PSDrive $targetDrive -ErrorAction SilentlyContinue) {
   throw "$($targetDrive): ja esta em uso por outro programa. Desmonte o mapeamento existente antes de iniciar."
 }
 
+$ftpPort = 2122
+if ($env:PORT) {
+  [int]::TryParse($env:PORT, [ref]$ftpPort) | Out-Null
+} elseif (Test-Path ".\rclone-nebula.conf") {
+  $confContent = Get-Content ".\rclone-nebula.conf"
+  if ($confContent -match "port\s*=\s*(\d+)") {
+    $ftpPort = [int]$matches[1]
+  }
+}
+
 $deadline = (Get-Date).AddSeconds(60)
 while ((Get-Date) -lt $deadline) {
   try {
     $client = [Net.Sockets.TcpClient]::new()
-    $client.Connect("127.0.0.1", 2121)
+    $client.Connect("127.0.0.1", $ftpPort)
     $client.Close()
     break
   } catch {

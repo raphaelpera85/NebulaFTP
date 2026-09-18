@@ -194,7 +194,7 @@ HOST=0.0.0.0
 PORT=2121
 Performance
 
-MAX_WORKERS=4 # Workers de upload
+MAX_WORKERS=10 # Máximo de arquivos enviados simultaneamente
 CHUNK_SIZE_MB=64 # Tamanho dos chunks
 MAX_RETRIES=5 # Tentativas de retry
 Logging

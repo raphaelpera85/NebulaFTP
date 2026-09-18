@@ -129,12 +129,35 @@ async def test_global_upload_concurrency_limit(monkeypatch):
     assert peak == 2
 
 
-def test_worker_count_is_bounded_by_real_transmission_slots(monkeypatch):
-    monkeypatch.setattr(main_mod, "MAX_WORKERS", 24)
-    monkeypatch.setattr(main_mod, "UPLOAD_CONCURRENCY", 8)
-    monkeypatch.setattr(main_mod, "PART_WORKERS_PER_FILE", 2)
+def test_worker_count_uses_file_limit_not_transmission_slots(monkeypatch):
+    monkeypatch.setattr(main_mod, "MAX_WORKERS", 10)
+    monkeypatch.setattr(main_mod, "UPLOAD_CONCURRENCY", 80)
+    monkeypatch.setattr(main_mod, "PART_WORKERS_PER_FILE", 4)
 
-    assert main_mod.get_upload_worker_count(23) == 4
+    assert main_mod.get_upload_worker_count(23) == 5
+
+
+def test_worker_count_allows_ten_files_with_a_single_bot(monkeypatch):
+    monkeypatch.setattr(main_mod, "MAX_WORKERS", 10)
+    monkeypatch.setattr(main_mod, "UPLOAD_CONCURRENCY", 80)
+    monkeypatch.setattr(main_mod, "PART_WORKERS_PER_FILE", 3)
+
+    assert main_mod.get_upload_worker_count(1) == 1
+
+
+def test_media_bot_selection_rotates_across_full_pool(monkeypatch):
+    if not hasattr(main_mod, "select_media_bots"):
+        pytest.skip("select_media_bots substituido por rotacao nativa por parte em upload_part_with_retries")
+    monkeypatch.setattr(main_mod, "MAX_BOTS_PER_MEDIA", 3)
+    bots = [f"bot{index}" for index in range(5)]
+
+    first = main_mod.select_media_bots(bots)
+    second = main_mod.select_media_bots(bots)
+
+    assert first == ["bot0", "bot1", "bot2"]
+    assert second == ["bot3", "bot4", "bot0"]
+    assert len(first) <= 3
+    assert len(second) <= 3
 
 
 def test_staging_path_detection(monkeypatch, tmp_path):
@@ -849,11 +872,15 @@ async def test_restore_pending_uploads_prioritizes_oldest_downloaded_file(tmp_pa
             return self.items.pop(0)
 
     class FakeFiles:
-        def find(self, query):
+        def find(self, query, *a, **k):
+            if query.get("status") == "failed":
+                return FakeCursor([])
             return FakeCursor(list(docs))
         async def find_one(self, *a, **k):
             return None
         async def update_one(self, *a, **k):
+            pass
+        async def delete_one(self, *a, **k):
             pass
 
     class FakeMongo:
@@ -890,7 +917,11 @@ async def test_queued_mongo_scanner_requests_oldest_first(tmp_path, monkeypatch)
             if len(captured_calls) == 1:
                 return {"_id": "1", "name": "old.mkv", "parent": "/Filmes", "status": "queued", "local_path": str(file_old), "mtime": 1000}
             return None
+        async def find_one(self, *a, **k):
+            return None
         async def update_one(self, *a, **k):
+            pass
+        async def delete_one(self, *a, **k):
             pass
 
     class FakeMongo:
@@ -918,3 +949,156 @@ async def test_queued_mongo_scanner_requests_oldest_first(tmp_path, monkeypatch)
     assert not queue.empty()
     item = queue.get_nowait()
     assert item["filename"] == "old.mkv"
+
+
+@pytest.mark.asyncio
+async def test_restore_pending_uploads_deletes_duplicate_local_and_mongo(tmp_path, monkeypatch):
+    dup_file = tmp_path / "dup.mkv"
+    dup_file.write_bytes(b"duplicate_content")
+    assert dup_file.exists()
+
+    deleted_ids = []
+
+    class FakeFiles:
+        def find(self, query, *args, **kwargs):
+            class AsyncIter:
+                def __init__(self, items):
+                    self.items = items
+                def __aiter__(self):
+                    self._it = iter(self.items)
+                    return self
+                async def __anext__(self):
+                    try:
+                        return next(self._it)
+                    except StopIteration:
+                        raise StopAsyncIteration
+            if query.get("status") == "failed":
+                return AsyncIter([])
+            return AsyncIter([
+                {"_id": "dup_1", "name": "dup.mkv", "parent": "/Filmes", "status": "queued", "local_path": str(dup_file)}
+            ])
+
+        async def find_one(self, query, *args, **kwargs):
+            # Simula que ja existe outro arquivo com mesmo parent e name
+            if query.get("name") == "dup.mkv":
+                return {"_id": "original_id"}
+            return None
+
+        async def delete_one(self, query):
+            deleted_ids.append(query["_id"])
+
+        async def update_one(self, *a, **k):
+            pass
+
+    class FakeMongo:
+        files = FakeFiles()
+
+    queue = asyncio.Queue()
+    monkeypatch.setattr(main_mod, "UPLOAD_QUEUE", queue)
+    async def fake_resolve(*a, **k):
+        return a[1]
+    monkeypatch.setattr(main_mod, "resolve_media_parent", fake_resolve)
+    monkeypatch.setattr(main_mod, "log_queue_state", AsyncMock())
+
+    await main_mod.restore_pending_uploads(FakeMongo())
+
+    # Deve ter deletado o arquivo fisico
+    assert not dup_file.exists()
+    # Deve ter deletado o documento no MongoDB
+    assert "dup_1" in deleted_ids
+    # Nao deve ter enfileirado nada
+    assert queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_queued_mongo_scanner_deletes_duplicate_local_and_mongo(tmp_path, monkeypatch):
+    dup_file = tmp_path / "dup_scanner.mkv"
+    dup_file.write_bytes(b"duplicate_content_scanner")
+    assert dup_file.exists()
+
+    deleted_ids = []
+    calls = 0
+
+    class FakeFiles:
+        async def find_one_and_update(self, q, update, sort=None, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return {"_id": "dup_2", "name": "dup_scanner.mkv", "parent": "/Filmes", "status": "queued", "local_path": str(dup_file)}
+            return None
+
+        async def find_one(self, query, *args, **kwargs):
+            if query.get("name") == "dup_scanner.mkv":
+                return {"_id": "original_2"}
+            return None
+
+        async def delete_one(self, query):
+            deleted_ids.append(query["_id"])
+
+        async def update_one(self, *a, **k):
+            pass
+
+    class FakeMongo:
+        files = FakeFiles()
+
+    queue = asyncio.Queue()
+    monkeypatch.setattr(main_mod, "UPLOAD_QUEUE", queue)
+    async def fake_resolve(*a, **k):
+        return a[1]
+    monkeypatch.setattr(main_mod, "resolve_media_parent", fake_resolve)
+
+    orig_sleep = asyncio.sleep
+    async def fake_sleep(sec):
+        raise asyncio.CancelledError()
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    try:
+        await main_mod.queued_mongo_scanner(FakeMongo(), max_workers=1)
+    except asyncio.CancelledError:
+        pass
+
+    assert not dup_file.exists()
+    assert "dup_2" in deleted_ids
+    assert queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_duplicate_target_records(tmp_path):
+    f1 = tmp_path / "legacy_dup1.mkv"
+    f1.write_bytes(b"legacy1")
+    f2 = tmp_path / "legacy_dup2.mkv"
+    f2.write_bytes(b"legacy2")
+    assert f1.exists() and f2.exists()
+
+    deleted_ids = []
+
+    class FakeFiles:
+        def find(self, query, *args, **kwargs):
+            class AsyncIter:
+                def __init__(self, items):
+                    self.items = items
+                def __aiter__(self):
+                    self._it = iter(self.items)
+                    return self
+                async def __anext__(self):
+                    try:
+                        return next(self._it)
+                    except StopIteration:
+                        raise StopAsyncIteration
+            return AsyncIter([
+                {"_id": "l1", "name": "legacy_dup1.mkv", "local_path": str(f1), "status": "failed", "failed_reason": "duplicate_target"},
+                {"_id": "l2", "name": "legacy_dup2.mkv", "local_path": str(f2), "status": "failed", "failed_reason": "duplicate_target"},
+            ])
+
+        async def delete_one(self, query):
+            deleted_ids.append(query["_id"])
+
+    class FakeMongo:
+        files = FakeFiles()
+
+    await main_mod.cleanup_duplicate_target_records(FakeMongo())
+
+    assert not f1.exists()
+    assert not f2.exists()
+    assert deleted_ids == ["l1", "l2"]
+

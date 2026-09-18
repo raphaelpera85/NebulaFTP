@@ -87,7 +87,7 @@ def ftp_settings() -> tuple[str, int, str, str]:
     password = Cipher(algorithms.AES(RCLONE_KEY), modes.CTR(iv)).decryptor().update(payload)
     return (
         section.get("host", "127.0.0.1"),
-        section.getint("port", 2121),
+        section.getint("port", 2122),
         section["user"],
         password.decode("utf-8"),
     )

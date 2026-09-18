@@ -368,6 +368,7 @@ class NebulaGUI:
             pady=5,
             padx=10,
         )
+        self.progress_frame = progress_frame
         nebula_paned.add(progress_frame, weight=1)
 
         self.canvas = tk.Canvas(progress_frame, bg="#181825", highlightthickness=0)
@@ -993,7 +994,9 @@ class NebulaGUI:
             return
         if not automatic:
             self.auto_restart_attempts = 0
-        for port in (2121, 2122):
+        ftp_port = int(os.environ.get("PORT", "2122"))
+        stream_port = int(os.environ.get("STREAM_PORT", "2124"))
+        for port in (ftp_port, stream_port):
             try:
                 with socket.create_connection(("127.0.0.1", port), timeout=0.3):
                     messagebox.showerror(
@@ -1079,11 +1082,12 @@ class NebulaGUI:
             if not rclone:
                 self.root.after(0, self.log, "rclone não encontrado; unidade N: não montada.")
                 return
+        ftp_port = int(os.environ.get("PORT", "2122"))
         for _ in range(180):
             if not self.is_running:
                 return
             try:
-                with socket.create_connection(("127.0.0.1", 2121), timeout=1):
+                with socket.create_connection(("127.0.0.1", ftp_port), timeout=1):
                     break
             except OSError:
                 time.sleep(1)
@@ -1445,10 +1449,37 @@ class NebulaGUI:
             if self.is_running:
                 try:
                     client = MongoClient(self.mongo_uri, serverSelectionTimeoutMS=1000)
-                    active_docs = list(client.ftp.files.find({"status": {"$in": ["uploading", "queued"]}}, {"name": 1, "status": 1, "size": 1, "uploaded_bytes": 1, "parts": 1, "worker_id": 1, "bot_index": 1}))
+                    active_docs = list(client.ftp.files.find({"status": {"$in": ["uploading", "queued", "staging"]}}, {"name": 1, "status": 1, "size": 1, "uploaded_bytes": 1, "parts": 1, "worker_id": 1, "bot_index": 1, "mtime": 1, "ctime": 1}))
                     client.close()
 
-                    current_names = {doc["name"] for doc in active_docs}
+                    def has_upload_progress(doc):
+                        try:
+                            return int(doc.get("uploaded_bytes") or 0) > 0
+                        except (TypeError, ValueError):
+                            return False
+
+                    active_count = sum(
+                        1
+                        for doc in active_docs
+                        if doc.get("status") == "uploading" or has_upload_progress(doc)
+                    )
+                    queued_count = len(active_docs) - active_count
+                    self.progress_frame.config(
+                        text=(
+                            " 📤 Uploads Ativos / Fila de Envio"
+                            f"  |  Ativos: {active_count}  |  Fila: {queued_count} arquivo(s)"
+                        )
+                    )
+
+                    # A fila é representada somente pelo contador. Os cards
+                    # devem mostrar exclusivamente arquivos que já começaram
+                    # a transmitir.
+                    upload_docs = [
+                        doc
+                        for doc in active_docs
+                        if doc.get("status") == "uploading" or has_upload_progress(doc)
+                    ]
+                    current_names = {doc["name"] for doc in upload_docs}
 
                     # Remove barras antigas
                     for name in list(self.file_bars.keys()):
@@ -1457,7 +1488,7 @@ class NebulaGUI:
                             del self.file_bars[name]
 
                     # Atualiza ou cria novas barras
-                    for doc in active_docs:
+                    for doc in upload_docs:
                         name = doc.get("name", "Arquivo")
                         status = doc.get("status", "uploading")
                         total = doc.get("size", 1) or 1
@@ -1486,10 +1517,7 @@ class NebulaGUI:
                             pct = 0.0
 
                         display_name = doc.get("display_name", name)
-                        if status == "uploading":
-                            info_text = f"Uploading | Worker #{worker_id} | {bot_text} | {display_name[:50]}"
-                        else:
-                            info_text = f"Na fila para envio | {display_name[:50]}"
+                        info_text = f"Uploading | Worker #{worker_id} | {bot_text} | {display_name[:50]}"
 
                         if name not in self.file_bars:
                             item_frame = tk.Frame(self.scroll_content, bg="#313244", pady=6, padx=10)

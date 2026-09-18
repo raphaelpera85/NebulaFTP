@@ -37,18 +37,30 @@ def normalize_string(s: str) -> str:
 def get_completed_telegram_items(db) -> set[str]:
     """Fetch normalized names of all files and folders completed in Telegram."""
     completed = set()
+    dir_names = {}
+    try:
+        dir_names = {
+            d["_id"]: d.get("name", "")
+            for d in db.files.find({"type": "dir"}, {"_id": 1, "name": 1})
+        }
+    except Exception:
+        pass
+
     for doc in db.files.find({"type": "file", "status": "completed"}):
         parent = doc.get("parent", "")
         name = doc.get("name", "")
 
         # Add parent folder name if present
         if parent:
-            folder_name = parent.rstrip("/").split("/")[-1]
+            if isinstance(parent, str):
+                folder_name = parent.rstrip("/").split("/")[-1]
+            else:
+                folder_name = dir_names.get(parent, "")
             if folder_name and folder_name not in ("Filmes", "Series"):
-                completed.add(normalize_string(folder_name))
+                completed.add(normalize_string(str(folder_name)))
 
         # Add file stem
-        if name:
+        if name and isinstance(name, str):
             stem = os.path.splitext(name)[0]
             if stem:
                 completed.add(normalize_string(stem))
