@@ -102,6 +102,12 @@ MAX_STAGING_AGE = int(environ.get("MAX_STAGING_AGE", "3600"))
 MAX_WORKERS = int(environ.get("MAX_WORKERS", "4"))
 PART_WORKERS_PER_FILE = max(1, int(environ.get("PART_WORKERS_PER_FILE", "2")))
 UPLOAD_CONCURRENCY = max(1, int(environ.get("UPLOAD_CONCURRENCY", "8")))
+SMALL_FILE_MAX_MB = int(environ.get("SMALL_FILE_MAX_MB", "50"))
+SMALL_FILE_MAX_BYTES = SMALL_FILE_MAX_MB * 1024 * 1024
+SMALL_WORKERS_CONFIG = int(environ.get("SMALL_WORKERS", "12"))
+LARGE_WORKERS_CONFIG = int(environ.get("LARGE_WORKERS", str(MAX_WORKERS)))
+if hasattr(UPLOAD_QUEUE, "small_file_max_bytes"):
+    UPLOAD_QUEUE.small_file_max_bytes = SMALL_FILE_MAX_BYTES
 STREAM_ONLY = environ.get("STREAM_ONLY", "false").lower() in ("1", "true", "yes")
 UPLOAD_STATUS_MESSAGES = environ.get("UPLOAD_STATUS_MESSAGES", "false").lower() in ("1", "true", "yes")
 STREAM_HOST = environ.get("STREAM_HOST", "127.0.0.1")
@@ -150,7 +156,15 @@ def is_loopback_host(host):
 def get_upload_worker_count(bot_count):
     # Each worker uploads one file at a time using PART_WORKERS_PER_FILE parallel parts.
     target_workers = max(1, bot_count // PART_WORKERS_PER_FILE)
-    return min(MAX_WORKERS, UPLOAD_CONCURRENCY // PART_WORKERS_PER_FILE, target_workers)
+    concurrency_limit = max(UPLOAD_CONCURRENCY // PART_WORKERS_PER_FILE, bot_count // PART_WORKERS_PER_FILE, 1)
+    limit = max(MAX_WORKERS, LARGE_WORKERS_CONFIG)
+    return min(limit, concurrency_limit, target_workers)
+
+
+def get_small_upload_worker_count(bot_count):
+    """Number of dedicated workers for small files (<= 50MB, e.g. .jpg, .png, .nfo, subtitles)."""
+    configured = int(environ.get("SMALL_WORKERS", str(SMALL_WORKERS_CONFIG)))
+    return max(1, min(configured, bot_count))
 
 
 def next_upload_bot_index(bot_count):
@@ -1013,18 +1027,37 @@ async def queued_mongo_scanner(mongo, max_workers=None):
     """Scans MongoDB for 'queued' files with local_path in oldest-downloaded-first order (mtime/ctime ascending) and moves them to UPLOAD_QUEUE."""
     if max_workers is None:
         max_workers = min(MAX_WORKERS, UPLOAD_CONCURRENCY)
-    logger.info("Iniciando queued_mongo_scanner ordenado pelo arquivo mais antigo baixado (intervalo=1s, max_por_iteracao=%d)", max_workers)
+    batch_limit = max(max_workers, 30)
+    logger.info("Iniciando queued_mongo_scanner ordenado pelo arquivo mais antigo baixado (intervalo=1s, max_por_iteracao=%d)", batch_limit)
 
     while True:
         try:
             found = 0
-            for _ in range(max_workers):
+            # If large lane is running low, prioritize pulling large files so large workers never starve
+            large_needed = hasattr(UPLOAD_QUEUE, "large_qsize") and UPLOAD_QUEUE.large_qsize() < 6
+
+            for _ in range(batch_limit):
                 q = {"type": "file", "status": "queued", "local_path": {"$exists": True}}
-                doc = await mongo.files.find_one_and_update(
-                    q,
-                    {"$set": {"status": "staging", "staged_at": int(time.time())}},
-                    sort=[("mtime", 1), ("ctime", 1), ("_id", 1)],
-                )
+                doc = None
+                if large_needed:
+                    q_large = dict(q)
+                    q_large["size"] = {"$gt": SMALL_FILE_MAX_BYTES}
+                    doc = await mongo.files.find_one_and_update(
+                        q_large,
+                        {"$set": {"status": "staging", "staged_at": int(time.time())}},
+                        sort=[("mtime", 1), ("ctime", 1), ("_id", 1)],
+                    )
+                    if doc:
+                        large_needed = hasattr(UPLOAD_QUEUE, "large_qsize") and UPLOAD_QUEUE.large_qsize() < 6
+                    else:
+                        large_needed = False
+
+                if not doc:
+                    doc = await mongo.files.find_one_and_update(
+                        q,
+                        {"$set": {"status": "staging", "staged_at": int(time.time())}},
+                        sort=[("mtime", 1), ("ctime", 1), ("_id", 1)],
+                    )
                 if not doc:
                     break
                 try:
@@ -1501,7 +1534,11 @@ async def upload_worker_parallel(bots, target_chat_id, mongo, worker_id):
     logger.debug(f"Worker #{worker_id} pronto (bots={len(bots)}, partes={PART_WORKERS_PER_FILE})")
     while True:
         try:
-            task = await asyncio.wait_for(UPLOAD_QUEUE.get(), timeout=2.0)
+            get_fn = getattr(UPLOAD_QUEUE, "get_large", None)
+            if callable(get_fn):
+                task = await asyncio.wait_for(get_fn(fallback_to_small=True), timeout=2.0)
+            else:
+                task = await asyncio.wait_for(UPLOAD_QUEUE.get(), timeout=2.0)
         except TimeoutError:
             continue
 
@@ -1675,6 +1712,110 @@ async def upload_worker_parallel(bots, target_chat_id, mongo, worker_id):
         finally:
             ACTIVE_UPLOADS.discard(local_path)
             UPLOAD_QUEUE.task_done()
+
+
+async def upload_small_file_worker(bots, target_chat_id, mongo, worker_id):
+    """Dedicated fast-lane worker for small files (<= 50MB, e.g. .jpg, .png, .nfo, subtitles).
+
+    Bypasses read-ahead chunking and multi-part overhead, uploading single-part files directly
+    across rotating bots to clear the queue and free staging disk space immediately.
+    """
+    logger.debug(f"[SmallW#{worker_id}] Pronto (bots={len(bots)})")
+    while True:
+        try:
+            get_fn = getattr(UPLOAD_QUEUE, "get_small", None)
+            if callable(get_fn):
+                task = await asyncio.wait_for(get_fn(), timeout=2.0)
+            else:
+                task = await asyncio.wait_for(UPLOAD_QUEUE.get(), timeout=2.0)
+        except TimeoutError:
+            continue
+
+        local_path = task["path"]
+        filename = task["filename"]
+        parent = task["parent"]
+        ACTIVE_UPLOADS.add(local_path)
+        try:
+            if filename.endswith(".partial") or not os.path.exists(local_path):
+                continue
+            real_size = os.path.getsize(local_path)
+            if real_size == 0:
+                safe_remove_staging_file(local_path)
+                continue
+
+            # If misrouted or file grew beyond small threshold, route to large queue
+            if real_size > SMALL_FILE_MAX_BYTES:
+                await UPLOAD_QUEUE.put({"path": local_path, "filename": filename, "parent": parent, "size": real_size})
+                continue
+
+            parent = await resolve_media_parent(mongo, parent, filename)
+            file_doc = await mongo.files.find_one({"name": filename, "parent": parent})
+            if not file_doc:
+                file_doc = await mongo.files.find_one({"name": filename, "local_path": local_path})
+            if not file_doc:
+                logger.warning(f"[SmallW{worker_id}] Metadados nao encontrados: {filename}")
+                continue
+
+            file_doc = await mongo.files.find_one_and_update(
+                {"_id": file_doc["_id"], "status": {"$in": ["queued", "staging"]}},
+                {"$set": {"parent": parent, "status": "uploading", "worker_id": f"small_{worker_id}", "started_at": int(time.time())}},
+                return_document=ReturnDocument.AFTER,
+            )
+            if not file_doc:
+                logger.info(f"[SmallW{worker_id}] Ignorado ja processado: {filename}")
+                continue
+            await log_queue_state(mongo, f"inicio:{filename}")
+
+            media_type = classify_media_type(parent, filename)
+            file_uuid = str(uuid.uuid4())
+            async with aiofiles.open(local_path, "rb") as f:
+                chunk_data = await f.read()
+
+            caption = build_part_caption(media_type, filename, 0, 1, file_uuid, real_size)
+            part_result = await upload_part_with_retries(
+                f"S{worker_id}", bots, target_chat_id, local_path, file_uuid, 0, chunk_data, 1, caption=caption
+            )
+
+            parts_metadata = [part_result]
+            stream_bot_name = part_result.get("bot_name")
+            await mongo.files.update_one(
+                {"_id": file_doc["_id"]},
+                {
+                    "$set": {
+                        "size": real_size,
+                        "media_type": media_type,
+                        "part_count": 1,
+                        "uploaded_at": int(time.time()),
+                        "parts": parts_metadata,
+                        "obfuscated_id": file_uuid,
+                        "status": "completed",
+                        "stream_bot_name": stream_bot_name,
+                        "search_name": filename.lower(),
+                        "search_parent": parent.lower(),
+                    },
+                    "$unset": {"uploadId": 1, "local_path": 1},
+                },
+            )
+            async with MongoDBPathIO._cache_lock:
+                MongoDBPathIO._memory_cache.pop(f"{parent}::{filename}", None)
+            logger.info(f"[SmallW{worker_id}] Concluido: {filename} ({real_size / 1024:.1f} KB)")
+            await log_queue_state(mongo, f"concluido:{filename}")
+            Metrics.log_success(real_size)
+            force_del = bool(file_doc.get("delete_source")) if file_doc else False
+            safe_remove_staging_file(local_path, force_delete=force_del)
+        except Exception as exc:
+            logger.error(f"[SmallW{worker_id}] Abortado: {filename}: {exc}")
+            Metrics.log_fail()
+            with contextlib.suppress(Exception):
+                await mongo.files.update_one(
+                    {"name": filename, "local_path": local_path},
+                    {"$set": {"status": "failed", "failed_at": int(time.time()), "failed_reason": str(exc)}},
+                )
+            await log_queue_state(mongo, f"falha:{filename}")
+        finally:
+            ACTIVE_UPLOADS.discard(local_path)
+            UPLOAD_QUEUE.task_done()
+
 
 async def resolve_channel(bot):
     raw_chat = environ.get("CHAT_ID")
@@ -2313,17 +2454,27 @@ async def main():
         background_tasks.append(folder_task)
         await restore_pending_uploads(mongo)
         upload_worker_count = get_upload_worker_count(len(upload_bots))
+        small_worker_count = get_small_upload_worker_count(len(upload_bots))
         logger.info(
-            "Workers de upload ativos: %s (configurados=%s, transmissoes=%s, bots=%s).",
+            "Workers de upload ativos: %s grandes / %s pequenos (configurados: max_grandes=%s, max_pequenos=%s, bots=%s).",
             upload_worker_count,
-            MAX_WORKERS,
-            UPLOAD_CONCURRENCY,
+            small_worker_count,
+            LARGE_WORKERS_CONFIG,
+            SMALL_WORKERS_CONFIG,
             len(upload_bots),
         )
-        background_tasks.append(asyncio.create_task(queued_mongo_scanner(mongo, max_workers=upload_worker_count * PART_WORKERS_PER_FILE)))
+        background_tasks.append(
+            asyncio.create_task(
+                queued_mongo_scanner(mongo, max_workers=max(upload_worker_count * PART_WORKERS_PER_FILE, 30))
+            )
+        )
         for i in range(upload_worker_count):
             background_tasks.append(
                 asyncio.create_task(upload_worker_parallel(upload_bots, target_chat_id, mongo, i + 1))
+            )
+        for i in range(small_worker_count):
+            background_tasks.append(
+                asyncio.create_task(upload_small_file_worker(upload_bots, target_chat_id, mongo, i + 1))
             )
 
     ftp_server_task = asyncio.create_task(server.serve_forever())

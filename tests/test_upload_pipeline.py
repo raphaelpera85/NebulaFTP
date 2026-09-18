@@ -1122,3 +1122,14 @@ async def test_cleanup_duplicate_target_records(tmp_path):
     assert not f2.exists()
     assert deleted_ids == ["l1", "l2"]
 
+
+def test_get_small_upload_worker_count(monkeypatch):
+    assert main_mod.get_small_upload_worker_count(28) == 12
+    assert main_mod.get_small_upload_worker_count(4) == 4
+    assert main_mod.get_small_upload_worker_count(1) == 1
+
+    monkeypatch.setenv("SMALL_WORKERS", "6")
+    assert main_mod.get_small_upload_worker_count(28) == 6
+
+
+
