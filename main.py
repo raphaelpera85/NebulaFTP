@@ -429,6 +429,23 @@ def safe_remove_staging_file(path, force_delete=False):
         logger.debug("staging cleanup skipped: %s", exc)
 
 
+def queue_identity(path: str) -> str:
+    """Chave estável para impedir que dois scanners registrem o mesmo arquivo."""
+    return os.path.normcase(os.path.abspath(path)).rstrip("\\/")
+
+
+def has_telegram_parts(doc: dict) -> bool:
+    """Indica que o Telegram já recebeu ao menos uma parte do arquivo."""
+    if doc.get("tg_file_id") or doc.get("file_id"):
+        return True
+    return any(
+        isinstance(part, dict) and (
+            part.get("tg_file_id") or part.get("file_id") or part.get("tg_message")
+        )
+        for part in (doc.get("parts") or [])
+    )
+
+
 def _search_key(value):
     return (value or "").strip().casefold()
 
@@ -789,6 +806,11 @@ async def stats_reporter(mongo):
                         if doc and doc.get("status") in {"queued", "uploading", "completed", "staging"}:
                             continue
 
+                        if doc and doc.get("status") in {"failed", "staging"} and has_telegram_parts(doc):
+                            safe_remove_staging_file(fp, force_delete=True)
+                            logger.info("Ignorado arquivo já enviado parcialmente ao Telegram: %s", display_name)
+                            continue
+
                         if doc and doc.get("status") in {"failed", "staging"}:
                             await mongo.files.update_one(
                                 {"_id": doc["_id"]},
@@ -831,7 +853,16 @@ async def stats_reporter(mongo):
                             }
 
                             try:
-                                await mongo.files.insert_one(file_doc)
+                                file_doc["queue_identity"] = queue_identity(fp)
+                                result = await mongo.files.update_one(
+                                    {"queue_identity": file_doc["queue_identity"]},
+                                    {"$setOnInsert": file_doc},
+                                    upsert=True,
+                                )
+                                if not result.upserted_id:
+                                    _stagingScanJournal[full_path] = StagingScanEntry(scanStamp, Handled=True)
+                                    logger.debug("Já enfileirado por outro produtor: %s", display_name)
+                                    continue
                                 await UPLOAD_QUEUE.put({
                                     "path": fp, "filename": display_name, "parent": parent_path, "size": size_t1
                                 })
@@ -2273,6 +2304,10 @@ async def setup_database_indexes(db) -> None:
             await files.create_index(keys, background=True, **kwargs)
         except OperationFailure:
             pass  # index already exists with same or compatible spec
+    try:
+        await files.create_index([("queue_identity", 1)], unique=True, sparse=True, background=True)
+    except OperationFailure:
+        pass
     logger.info("Índices MongoDB verificados.")
 
 
