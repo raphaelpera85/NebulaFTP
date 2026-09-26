@@ -333,10 +333,14 @@ class Server:
         try:
             s = line.decode('utf-8').rstrip()
         except UnicodeDecodeError:
-            # Fallback para Latin-1 (FileZilla antigo em Windows)
+            # Fallback para Latin-1 (FileZilla antigo em Windows). latin-1 mapeia
+            # todo byte 0-255 para um codepoint, então na prática nunca lança
+            # UnicodeDecodeError aqui; o except genérico anterior escondia isso e
+            # também capturava BaseException (SystemExit/KeyboardInterrupt/etc).
+            # Mantido como rede de segurança explícita, não mais um bare except.
             try:
                 s = line.decode('latin-1').rstrip()
-            except:
+            except Exception:
                 s = line.decode('utf-8', errors='ignore').rstrip()
         
         # Normalização Unicode (Crucial para acentos)
