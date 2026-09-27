@@ -242,6 +242,9 @@ def destination_for(source_root: Path, dest_root: Path, src: Path) -> Path:
     while len(parts) >= 2 and parts[0].lower() in ("filmes", "series", "porno") and parts[1].lower() == parts[0].lower():
         parts.pop(0)
 
+    if parts and parts[0].casefold() in {"animações", "animacoes", "doramas", "novelas"}:
+        return dest_root / Path(*parts)
+
     series_by_name = series_path_from_filename(dest_root, src)
     if len(parts) >= 2 and parts[0].lower() == "filmes":
         if series_by_name:

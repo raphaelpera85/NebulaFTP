@@ -972,7 +972,7 @@ async def test_queued_mongo_scanner_requests_oldest_first(tmp_path, monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_restore_pending_uploads_deletes_duplicate_local_and_mongo(tmp_path, monkeypatch):
+async def test_restore_pending_uploads_preserves_duplicate_local_and_mongo(tmp_path, monkeypatch):
     dup_file = tmp_path / "dup.mkv"
     dup_file.write_bytes(b"duplicate_content")
     assert dup_file.exists()
@@ -1022,16 +1022,15 @@ async def test_restore_pending_uploads_deletes_duplicate_local_and_mongo(tmp_pat
 
     await main_mod.restore_pending_uploads(FakeMongo())
 
-    # Deve ter deletado o arquivo fisico
-    assert not dup_file.exists()
-    # Deve ter deletado o documento no MongoDB
-    assert "dup_1" in deleted_ids
+    # Duplicatas não podem apagar arquivo físico nem registro durante a restauração.
+    assert dup_file.exists()
+    assert deleted_ids == []
     # Nao deve ter enfileirado nada
     assert queue.empty()
 
 
 @pytest.mark.asyncio
-async def test_queued_mongo_scanner_deletes_duplicate_local_and_mongo(tmp_path, monkeypatch):
+async def test_queued_mongo_scanner_preserves_duplicate_local_and_mongo(tmp_path, monkeypatch):
     dup_file = tmp_path / "dup_scanner.mkv"
     dup_file.write_bytes(b"duplicate_content_scanner")
     assert dup_file.exists()
@@ -1077,8 +1076,8 @@ async def test_queued_mongo_scanner_deletes_duplicate_local_and_mongo(tmp_path, 
     except asyncio.CancelledError:
         pass
 
-    assert not dup_file.exists()
-    assert "dup_2" in deleted_ids
+    assert dup_file.exists()
+    assert deleted_ids == []
     assert queue.empty()
 
 
@@ -1091,6 +1090,7 @@ async def test_cleanup_duplicate_target_records(tmp_path):
     assert f1.exists() and f2.exists()
 
     deleted_ids = []
+    updated_ids = []
 
     class FakeFiles:
         def find(self, query, *args, **kwargs):
@@ -1113,14 +1113,18 @@ async def test_cleanup_duplicate_target_records(tmp_path):
         async def delete_one(self, query):
             deleted_ids.append(query["_id"])
 
+        async def update_one(self, query, update):
+            updated_ids.append(query["_id"])
+
     class FakeMongo:
         files = FakeFiles()
 
     await main_mod.cleanup_duplicate_target_records(FakeMongo())
 
-    assert not f1.exists()
-    assert not f2.exists()
-    assert deleted_ids == ["l1", "l2"]
+    assert f1.exists()
+    assert f2.exists()
+    assert deleted_ids == []
+    assert updated_ids == ["l1", "l2"]
 
 
 def test_get_small_upload_worker_count(monkeypatch):

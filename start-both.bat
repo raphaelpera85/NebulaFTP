@@ -24,7 +24,7 @@ echo ==============================================
 echo.
 echo This will start BOTH instances:
 echo   1. ORIGINAL NEBULA   - FTP:2121  Control:2130  Stream:2122  DB:ftp
-echo   2. MULLETAFLIX       - FTP:2123  Control:2131  Stream:2124  DB:ftp_mulletaflix
+echo   2. MULLETAFLIX       - FTP:2123  Control:2131  Stream:2124  DB:ftp
 echo.
 echo Make sure you have configured both .env files:
 echo   - .env              (Original)
@@ -40,19 +40,13 @@ if /i not "%CONFIRM%"=="y" (
 
 echo.
 echo [1/2] Starting ORIGINAL NEBULA...
-copy /y ".env" ".env.backup" >nul 2>&1
-start /b python -u main.py
+start "Nebula" /b cmd /d /c "set NEBULA_ENV_FILE=.env&& python -u main.py"
 echo Original Nebula started (PID captured in background).
 
 echo.
 echo [2/2] Starting MULLETAFLIX...
-copy /y ".env.mulletaflix" ".env" >nul
-start /b python -u main.py
+start "MulletaFlix" /b cmd /d /c "set NEBULA_ENV_FILE=.env.mulletaflix&& python -u main.py"
 echo MulletaFlix started (PID captured in background).
-
-:: Restore original .env
-copy /y ".env.backup" ".env" >nul 2>&1
-del ".env.backup" >nul 2>&1
 
 echo.
 echo ==============================================
@@ -62,7 +56,7 @@ echo.
 echo Original Nebula:   ftp://localhost:2121  |  http://localhost:2130  |  http://localhost:2122
 echo MulletaFlix:       ftp://localhost:2123  |  http://localhost:2131  |  http://localhost:2124
 echo.
-echo MongoDB Databases: Original=ftp  |  MulletaFlix=ftp_mulletaflix
+echo MongoDB Database compartilhado: ftp
 echo.
 echo To stop: Close this window or use Task Manager to kill python.exe processes.
 echo.

@@ -1130,6 +1130,11 @@ def destination_for(source: Path, dest: Path, src: Path) -> Path:
     while len(parts) >= 2 and parts[0].lower() in ("filmes", "series", "porno") and parts[1].lower() == parts[0].lower():
         parts.pop(0)
 
+    # Preserve the custom library roots.  Episode-name heuristics must not
+    # move these files into the generic Series tree.
+    if parts and parts[0].casefold() in {"animações", "animacoes", "doramas", "novelas"}:
+        return dest / Path(*parts)
+
     series_by_name = series_path_from_filename(dest, src)
     if len(parts) >= 2 and parts[0].lower() == "filmes":
         if series_by_name:

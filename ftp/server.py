@@ -508,6 +508,8 @@ class Server:
             await conn.path_io.rmdir(real)
         except PathIOError as exc:
             logger.debug("rmd ignored (%s): %s", rest, exc)
+            conn.response("550", "directory is not empty or cannot be removed")
+            return True
         conn.response("250", "ok"); return True
 
     @ConnectionConditions(ConnectionConditions.login_required, ConnectionConditions.passive_server_started)

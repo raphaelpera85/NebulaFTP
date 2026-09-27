@@ -31,6 +31,8 @@ if exist ".env" (
     exit /b 1
 )
 
+set "NEBULA_ENV_FILE=.env"
+
 echo.
 set /p MONITOR_PATHS="Digite uma ou mais pastas para monitorar separadas por ; (ex: E:\;D:\Videos) [Padrao: D:/midias]: "
 if "%MONITOR_PATHS%"=="" set MONITOR_PATHS=D:/midias

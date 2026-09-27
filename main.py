@@ -85,9 +85,10 @@ for stream in (sys.stdout, sys.stderr):
 pyrogram_utils.MIN_CHANNEL_ID = min(pyrogram_utils.MIN_CHANNEL_ID, -1009999999999)  # type: ignore
 install_reliable_upload()
 
-if exists(".env"):
+_env_file = environ.get("NEBULA_ENV_FILE", ".env")
+if exists(_env_file):
     from dotenv import load_dotenv
-    load_dotenv()
+    load_dotenv(dotenv_path=_env_file)
 
 # --- CARREGAMENTO DE CONFIGURAÇÕES DO .ENV ---
 LOG_LEVEL = environ.get("LOG_LEVEL", "INFO")
@@ -201,6 +202,9 @@ EPISODE_FILENAME_RE = re.compile(
     r"(?i)\b(?:s\d{1,2}[ ._-]*e\d{1,3}|\d{1,2}x\d{1,3})\b"
 )
 ADULT_FILENAME_RE = re.compile(r"(?i)\b(?:porno|porn|xxx|hentai|adulto)\b")
+LIBRARY_CATEGORIES = {
+    "filmes", "series", "porno", "animações", "animacoes", "doramas", "novelas",
+}
 
 
 def library_category(parent: str) -> str | None:
@@ -211,7 +215,7 @@ def library_category(parent: str) -> str | None:
     if len(parts) < 2:
         return None
     category = parts[1].casefold()
-    if category in {"filmes", "series", "porno"}:
+    if category in LIBRARY_CATEGORIES:
         return category
     return None
 
@@ -695,7 +699,10 @@ async def resolve_media_parent(mongo, parent, filename):
     parts = parent.strip("/").split("/")
     user_root = f"/{parts[0]}" if parts and parts[0] else default_user_root
     category = library_category(parent)
-    if category in {"series", "porno"}:
+    # These roots are authoritative too.  In particular, episodic content
+    # under Animações/Doramas/Novelas must stay in that category instead of
+    # being silently rerouted to /Series.
+    if category in LIBRARY_CATEGORIES - {"filmes"}:
         return parent
 
     series_parent = series_parent_from_filename(user_root, filename)
@@ -910,19 +917,23 @@ async def cleanup_strm_duplicate_records(mongo):
 
 
 async def cleanup_duplicate_target_records(mongo):
-    """Remove do local e da fila todos os registros duplicados marcados como failed."""
+    """Preserva registros duplicados legados para permitir recuperação do stage.
+
+    Registros duplicados não devem apagar arquivos automaticamente: em uma fila
+    compartilhada, outra instância pode ainda estar usando o mesmo arquivo.
+    """
     removed = 0
     async for doc in mongo.files.find(
         {"status": "failed", "failed_reason": "duplicate_target"},
         {"_id": 1, "name": 1, "local_path": 1, "parent": 1},
     ):
-        local_path = doc.get("local_path")
-        if local_path and os.path.exists(local_path):
-            safe_remove_staging_file(local_path, force_delete=True)
-        await mongo.files.delete_one({"_id": doc["_id"]})
+        await mongo.files.update_one(
+            {"_id": doc["_id"]},
+            {"$set": {"failed_reason": "duplicate_target_preserved", "preserved_at": int(time.time())}},
+        )
         removed += 1
     if removed:
-        logger.info("Removidos %s registros duplicados legados do local e da fila.", removed)
+        logger.warning("Preservados %s registros duplicados legados; nenhum arquivo foi removido do stage.", removed)
 
 
 def extract_media_year(name: str, parent_name: str = "") -> int:
@@ -1019,8 +1030,14 @@ async def restore_pending_uploads(mongo):
             if not local_path or not os.path.exists(local_path):
                 await mongo.files.update_one(
                     {"_id": doc["_id"]},
-                    {"$set": {"status": "failed", "failed_at": int(time.time()), "failed_reason": "local_path_missing"}},
+                    {"$set": {
+                        "status": doc.get("status", "queued"),
+                        "failed_at": int(time.time()),
+                        "failed_reason": "local_path_missing",
+                        "recovery_required": True,
+                    }},
                 )
+                logger.warning("Fila restaurada preservou registro sem arquivo local: %s (disco/stage ausente)", doc.get("name"))
                 continue
             parent = await resolve_media_parent(mongo, doc.get("parent"), doc["name"])
             duplicate = await mongo.files.find_one(
@@ -1028,18 +1045,20 @@ async def restore_pending_uploads(mongo):
                 {"_id": 1},
             )
             if duplicate:
-                if local_path and os.path.exists(local_path):
-                    safe_remove_staging_file(local_path, force_delete=True)
-                await mongo.files.delete_one({"_id": doc["_id"]})
-                logger.warning("Fila restaurada removeu duplicado do local e da fila: %s em %s", doc["name"], parent)
+                await mongo.files.update_one(
+                    {"_id": doc["_id"]},
+                    {"$set": {"status": "queued", "failed_reason": "duplicate_target_preserved", "recovery_required": True}},
+                )
+                logger.warning("Fila restaurada preservou duplicado no local e na fila: %s em %s", doc["name"], parent)
                 continue
             try:
                 await mongo.files.update_one({"_id": doc["_id"]}, {"$set": {"status": "staging", "parent": parent}})
             except DuplicateKeyError:
-                if local_path and os.path.exists(local_path):
-                    safe_remove_staging_file(local_path, force_delete=True)
-                await mongo.files.delete_one({"_id": doc["_id"]})
-                logger.warning("Fila restaurada encontrou duplicado concorrente e removeu do local e da fila: %s em %s", doc["name"], parent)
+                await mongo.files.update_one(
+                    {"_id": doc["_id"]},
+                    {"$set": {"status": "queued", "failed_reason": "duplicate_target_preserved", "recovery_required": True}},
+                )
+                logger.warning("Fila restaurada encontrou duplicado concorrente e preservou local/fila: %s em %s", doc["name"], parent)
                 continue
             await UPLOAD_QUEUE.put({
                 "path": local_path,
@@ -1068,7 +1087,14 @@ async def queued_mongo_scanner(mongo, max_workers=None):
             large_needed = hasattr(UPLOAD_QUEUE, "large_qsize") and UPLOAD_QUEUE.large_qsize() < 6
 
             for _ in range(batch_limit):
-                q = {"type": "file", "status": "queued", "local_path": {"$exists": True}}
+                # Registros cujo stage sumiu ficam preservados para recuperação,
+                # mas não devem ser revendidos em loop a cada segundo.
+                q = {
+                    "type": "file",
+                    "status": "queued",
+                    "local_path": {"$exists": True},
+                    "recovery_required": {"$ne": True},
+                }
                 doc = None
                 if large_needed:
                     q_large = dict(q)
@@ -1096,9 +1122,14 @@ async def queued_mongo_scanner(mongo, max_workers=None):
                     if not local_path or not os.path.exists(local_path):
                         await mongo.files.update_one(
                             {"_id": doc["_id"]},
-                            {"$set": {"status": "failed", "failed_at": int(time.time()), "failed_reason": "local_path_missing"}},
+                            {"$set": {
+                                "status": "queued",
+                                "failed_at": int(time.time()),
+                                "failed_reason": "local_path_missing",
+                                "recovery_required": True,
+                            }},
                         )
-                        logger.warning("Scanner Mongo: arquivo sem local_path valido: %s", doc.get("name"))
+                        logger.warning("Scanner Mongo: preservado arquivo sem local_path válido para recuperação: %s", doc.get("name"))
                         continue
                     parent = await resolve_media_parent(mongo, doc.get("parent"), doc["name"])
                     duplicate = await mongo.files.find_one(
@@ -1106,18 +1137,20 @@ async def queued_mongo_scanner(mongo, max_workers=None):
                         {"_id": 1},
                     )
                     if duplicate:
-                        if local_path and os.path.exists(local_path):
-                            safe_remove_staging_file(local_path, force_delete=True)
-                        await mongo.files.delete_one({"_id": doc["_id"]})
-                        logger.warning("Scanner Mongo: removeu duplicado do local e da fila: %s em %s", doc["name"], parent)
+                        await mongo.files.update_one(
+                            {"_id": doc["_id"]},
+                            {"$set": {"status": "queued", "failed_reason": "duplicate_target_preserved", "recovery_required": True}},
+                        )
+                        logger.warning("Scanner Mongo: preservou duplicado do local e da fila: %s em %s", doc["name"], parent)
                         continue
                     try:
                         await mongo.files.update_one({"_id": doc["_id"]}, {"$set": {"parent": parent}})
                     except DuplicateKeyError:
-                        if local_path and os.path.exists(local_path):
-                            safe_remove_staging_file(local_path, force_delete=True)
-                        await mongo.files.delete_one({"_id": doc["_id"]})
-                        logger.warning("Scanner Mongo: duplicado concorrente removido do local e da fila: %s em %s", doc["name"], parent)
+                        await mongo.files.update_one(
+                            {"_id": doc["_id"]},
+                            {"$set": {"status": "queued", "failed_reason": "duplicate_target_preserved", "recovery_required": True}},
+                        )
+                        logger.warning("Scanner Mongo: duplicado concorrente preservado no local e na fila: %s em %s", doc["name"], parent)
                         continue
                     await UPLOAD_QUEUE.put({
                         "path": local_path,
@@ -1147,11 +1180,11 @@ async def staging_scanner(mongo, staging_dirs):
                 stage_path = Path(stage_root)
                 if not stage_path.exists():
                     continue
-                # Busca arquivos de midia no stage
-                for ext in (".mkv", ".mp4", ".avi", ".mov", ".m4v", ".ts", ".webm"):
-                    for file_path in stage_path.rglob(f"*{ext}"):
-                        if not file_path.is_file():
-                            continue
+                # Busca todos os formatos aceitos pelo pipeline.  Manter uma
+                # lista separada de extensoes de video fazia imagens, audios
+                # e legendas enviadas ao Telegram desaparecerem da arvore.
+                for file_path in stage_path.rglob("*"):
+                    if file_path.is_file() and is_uploadable_name(file_path.name):
                         # Ignora arquivos temporarios ou de download parcial
                         name_str = file_path.name
                         if name_str.startswith(".") or ".part" in name_str.lower() or name_str.endswith(".download"):
@@ -1200,11 +1233,9 @@ async def staging_scanner(mongo, staging_dirs):
                                     continue
                                 # Em fila ou enviando: garante que o local_path atualizado aponta para onde o arquivo esta
                                 if st in ("queued", "staging", "uploading"):
-                                    if existing.get("local_path") != str(file_path):
-                                        await mongo.files.update_one(
-                                            {"_id": existing["_id"]},
-                                            {"$set": {"local_path": str(file_path), "size": size}},
-                                        )
+                                    updates = {"local_path": str(file_path), "size": size, "recovery_required": False}
+                                    if existing.get("local_path") != str(file_path) or existing.get("recovery_required"):
+                                        await mongo.files.update_one({"_id": existing["_id"]}, {"$set": updates})
                                     continue
                                 # Se estava com falha por ser duplicado, apaga do disco e limpa do banco
                                 if st == "failed" and existing.get("failed_reason") == "duplicate_target":

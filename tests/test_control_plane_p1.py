@@ -34,11 +34,18 @@ class Cursor:
 class Files:
     def __init__(self):
         self.deleted_many = []
+        self.deleted_one = []
 
     async def count_documents(self, query):
         return 0
 
+    async def find_one(self, query, *_args):
+        if query.get("type") == "dir":
+            return {"_id": "foo", "name": query["name"], "parent": query["parent"], "type": "dir"}
+        return None
+
     async def delete_one(self, query):
+        self.deleted_one.append(query)
         return None
 
     async def delete_many(self, query):
@@ -147,7 +154,7 @@ async def test_feeder_supervisor_uses_argv_and_rejects_outside_roots(tmp_path, m
 
 
 @pytest.mark.asyncio
-async def test_rmdir_does_not_match_prefix_sibling():
+async def test_rmdir_only_removes_empty_directory():
     files = Files()
     pathio = MongoDBPathIO()
     pathio.db = SimpleNamespace(files=files)
@@ -155,9 +162,8 @@ async def test_rmdir_does_not_match_prefix_sibling():
 
     await pathio.rmdir(PurePosixPath("/Foo"))
 
-    pattern = files.deleted_many[0]["parent"]["$regex"]
-    assert re.match(pattern, "/Foo/Child")
-    assert not re.match(pattern, "/FooBar/Child")
+    assert files.deleted_one == [{"_id": "foo"}]
+    assert files.deleted_many == []
 
 
 @pytest.mark.asyncio

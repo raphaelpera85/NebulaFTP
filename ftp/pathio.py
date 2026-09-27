@@ -102,7 +102,13 @@ CACHE_DIRS = [
 CACHE_DIR = get_cache_dir()
 UPLOADABLE_EXTENSIONS = {
     ".mkv", ".mp4", ".avi", ".mov", ".wmv", ".m4v",
-    ".sub", ".ass", ".ssa", ".vtt",
+    ".ts", ".webm", ".flv", ".mpeg", ".mpg", ".m2ts", ".3gp",
+    ".sub", ".ass", ".ssa", ".vtt", ".srt",
+    # Other media commonly stored alongside the video library.  These must
+    # use the same predicate as the staging scanner; otherwise they are
+    # silently treated as completed local files and never reach Telegram.
+    ".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff",
+    ".mp3", ".m4a", ".flac", ".wav", ".aac", ".ogg", ".opus", ".oga",
 }
 MOVIE_TOKEN_NOISE = {
     "aac", "ac3", "amzn", "bluray", "brrip", "com", "dual", "fgt", "galaxyrg",
@@ -551,13 +557,21 @@ class MongoDBPathIO(AbstractPathIO):
         path = self._absolute(path)
         parent, name = self._split_path(path)
         key = f"{parent}::{name}"
-        async with self._cache_lock: self._memory_cache.pop(key, None)
-        await self._files.delete_one({"name": name, "parent": parent})
         full = f"{parent}/{name}" if parent != "/" else f"/{name}"
-        # Escape any regex metacharacters in the path so sibling trees
-        # whose names happen to share a prefix (e.g. /Foo vs /FooBar)
-        # are not also wiped out.
-        await self._files.delete_many({"parent": {"$regex": f"^{re.escape(full)}(?:/|$)"}})
+        node = await self._files.find_one({"name": name, "parent": parent, "type": "dir"})
+        if node is None:
+            raise FileNotFoundError(full)
+
+        # FTP RMD is defined for empty directories. Never recursively delete
+        # a media tree here: an accidental Explorer/rclone RMD must not erase
+        # all files below a category or series folder.
+        child_count = await self._files.count_documents({"parent": full})
+        if child_count:
+            raise OSError(f"directory not empty: {full}")
+
+        async with self._cache_lock:
+            self._memory_cache.pop(key, None)
+        await self._files.delete_one({"_id": node["_id"]})
 
     @universal_exception
     async def unlink(self, path):

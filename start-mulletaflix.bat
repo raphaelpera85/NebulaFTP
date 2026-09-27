@@ -9,6 +9,8 @@ if exist "..\.venv\Scripts\activate.bat" (
     call ".\.venv\Scripts\activate.bat"
 )
 
+set "NEBULA_ENV_FILE=.env.mulletaflix"
+
 echo Verificando dependencias do NebulaFTP (MulletaFlix)...
 python .\tools\bootstrap.py
 if errorlevel 1 (

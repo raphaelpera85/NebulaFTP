@@ -1101,6 +1101,7 @@ class NebulaGUI:
         cmd = [
             rclone, "mount", "nebula:/", "N:",
             "--config", config_path,
+            "--read-only",
             "--vfs-cache-mode", "full",
             "--vfs-cache-max-size", "5G",
             "--vfs-cache-max-age", "5m",

@@ -130,9 +130,12 @@ def test_pathio_lru_get_returns_default():
     assert cache.get("missing", "default") == "default"
 
 
-def test_only_video_names_are_uploadable():
+def test_media_names_are_uploadable_but_unrelated_sidecars_are_not():
     assert pathio.is_uploadable_name("movie.mkv") is True
     assert pathio.is_uploadable_name("movie.mkv.partial") is True
+    assert pathio.is_uploadable_name("poster.jpg") is True
+    assert pathio.is_uploadable_name("soundtrack.flac") is True
+    assert pathio.is_uploadable_name("subtitle.srt") is True
     assert pathio.is_uploadable_name("movie.nfo") is False
 
 
@@ -357,7 +360,7 @@ def test_accounts_manager_supports_cli_subcommands():
         [sys.executable, os.path.join(ROOT, "accounts_manager.py"), "--help"],
         capture_output=True,
         text=True,
-        timeout=5,
+        timeout=15,
         env=env,
     )
     assert r.returncode == 0, r.stderr

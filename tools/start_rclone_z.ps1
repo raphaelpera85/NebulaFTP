@@ -145,6 +145,7 @@ $configFile = (Resolve-Path ".\rclone-nebula.conf").Path
 $rcloneLog = Join-Path ([System.IO.Path]::GetTempPath()) "rclone-mount.log"
 & $rclone mount nebula:/ "$($targetDrive):" `
   --config "$configFile" `
+  --read-only `
   --vfs-cache-mode full `
   --vfs-cache-max-size 5G `
   --vfs-cache-max-age 5m `
