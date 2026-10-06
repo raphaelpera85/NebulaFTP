@@ -218,7 +218,7 @@ async def test_stream_marks_bot_busy_and_persists_verified_route(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_stream_uses_free_bot_without_interrupting_upload(monkeypatch):
+async def test_stream_prioritizes_playback_during_upload(monkeypatch):
     class Bot:
         def __init__(self, name, uploads=0):
             self.name = name
@@ -236,7 +236,8 @@ async def test_stream_uses_free_bot_without_interrupting_upload(monkeypatch):
             self.client = client
 
         async def stream(self, offset=0):
-            assert self.client is free
+            assert self.client is busy
+            assert self.client._nebula_uploads == 1
             yield b"data"
 
     monkeypatch.setattr(pathio, "File", FakeFile)
@@ -254,7 +255,7 @@ async def test_stream_uses_free_bot_without_interrupting_upload(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_stream_waits_until_an_upload_bot_is_free(monkeypatch):
+async def test_stream_does_not_wait_for_active_upload(monkeypatch):
     class Bot:
         name = "busy"
         _nebula_uploads = 1
@@ -272,14 +273,11 @@ async def test_stream_waits_until_an_upload_bot_is_free(monkeypatch):
         async def stream(self, offset=0):
             yield b"data"
 
-    real_sleep = asyncio.sleep
-
-    async def release_on_wait(_delay):
-        bot._nebula_uploads = 0
-        await real_sleep(0)
+    async def fail_if_waiting(_delay):
+        raise AssertionError("playback must not wait for an upload")
 
     monkeypatch.setattr(pathio, "File", FakeFile)
-    monkeypatch.setattr(pathio, "asleep", release_on_wait)
+    monkeypatch.setattr(pathio, "asleep", fail_if_waiting)
     db = type("DB", (), {"files": type("Files", (), {"update_one": AsyncMock()})()})()
     node = pathio.Node(
         type="file", name="movie.mkv", size=4,
@@ -288,8 +286,65 @@ async def test_stream_waits_until_an_upload_bot_is_free(monkeypatch):
 
     reader = pathio.MongoDBMemoryIO(node, "rb", [bot], db)
     assert [chunk async for chunk in reader.iter_by_block(4)] == [b"data"]
-    assert bot._nebula_uploads == 0
+    assert bot._nebula_uploads == 1
     assert bot._nebula_streams == 0
+
+
+@pytest.mark.asyncio
+async def test_stream_raises_when_no_bot_has_part_data(monkeypatch):
+    class Bot:
+        name = "empty"
+        _nebula_streams = 0
+
+    class FakeFile:
+        reference_refreshed = False
+        file_id = "file1"
+
+        def __init__(self, _file_id, client, **_kwargs):
+            self.client = client
+
+        async def stream(self, offset=0):
+            if False:
+                yield b""
+
+    monkeypatch.setattr(pathio, "File", FakeFile)
+    db = type("DB", (), {"files": type("Files", (), {"update_one": AsyncMock()})()})()
+    node = pathio.Node(
+        type="file", name="movie.mkv", size=4,
+        parts=[{"part_id": 0, "file_size": 4, "tg_file": "file1", "bot_index": 0}],
+    )
+
+    reader = pathio.MongoDBMemoryIO(node, "rb", [Bot()], db)
+    with pytest.raises(OSError, match="could not be read"):
+        [chunk async for chunk in reader.iter_by_block(4)]
+
+
+@pytest.mark.asyncio
+async def test_stream_raises_when_telegram_part_is_truncated(monkeypatch):
+    class Bot:
+        name = "bot"
+        _nebula_streams = 0
+
+    class FakeFile:
+        reference_refreshed = False
+        file_id = "file1"
+
+        def __init__(self, _file_id, client, **_kwargs):
+            self.client = client
+
+        async def stream(self, offset=0):
+            yield b"da"
+
+    monkeypatch.setattr(pathio, "File", FakeFile)
+    db = type("DB", (), {"files": type("Files", (), {"update_one": AsyncMock()})()})()
+    node = pathio.Node(
+        type="file", name="movie.mkv", size=4,
+        parts=[{"part_id": 0, "file_size": 4, "tg_file": "file1", "bot_index": 0}],
+    )
+
+    reader = pathio.MongoDBMemoryIO(node, "rb", [Bot()], db)
+    with pytest.raises(OSError, match=r"truncated \(2/4 bytes\)"):
+        [chunk async for chunk in reader.iter_by_block(4)]
 
 
 @pytest.mark.asyncio

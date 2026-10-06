@@ -79,12 +79,12 @@ def test_iter_strm_files_prioritized(tmp_path):
     assert names[1] == "Filme C (2025).strm"
     assert names[2] == "Filme B (2024).strm"
 
-    # Depois Porno
-    assert names[3] == "Video 1.strm"
-
     # Depois Séries em ordem de episódio (E01 -> E02)
-    assert names[4] == "Dark.S01E01.strm"
-    assert names[5] == "Dark.S01E02.strm"
+    assert names[3] == "Dark.S01E01.strm"
+    assert names[4] == "Dark.S01E02.strm"
+
+    # Depois Porno
+    assert names[5] == "Video 1.strm"
 
 
 def test_destination_and_mongo_parent_mapping(tmp_path):
@@ -197,6 +197,7 @@ def test_download_strm_multipart_direct_and_resume(tmp_path, monkeypatch):
         return _FakeHTTPResponse(data, headers={"Content-Length": str(len(data))}, status=200)
 
     monkeypatch.setattr(strm_downloader, "urlopen", mock_urlopen)
+    monkeypatch.setattr(strm_downloader, "wait_for_disk_capacity", lambda *_args, **_kwargs: None)
 
     res = strm_downloader.download_strm_multipart(
         url="http://example.com/video.mp4",
@@ -321,6 +322,7 @@ def test_process_strm_item_moves_ready_media_to_stage(tmp_path, monkeypatch):
     validator = strm_downloader.MediaValidator(mongo_uri="mongodb://localhost:27017")
     # Mock do validador para não conectar ao Mongo/Telegram
     monkeypatch.setattr(validator, "is_already_completed_or_active", lambda *args, **kwargs: (False, "new"))
+    monkeypatch.setattr(strm_downloader, "wait_for_disk_capacity", lambda *_args, **_kwargs: None)
 
     registered_items = []
     def mock_register(downloaded_file, destination, dest_root, mongo_uri, db_name, library_user, delete_source=True):
@@ -353,7 +355,7 @@ def test_process_strm_item_moves_ready_media_to_stage(tmp_path, monkeypatch):
     # A pasta do filme que ficou vazia na origem deve ter sido deletada
     assert not movie_folder.exists()
 
-    expected_stage_file = stage_dir / "strm" / "Matrix (1999).mkv"
+    expected_stage_file = stage_dir / "Filmes" / "Matrix (1999)" / "Matrix (1999).mkv"
     assert expected_stage_file.exists()
     assert expected_stage_file.read_bytes() == b"media binary content 12345"
 

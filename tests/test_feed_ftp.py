@@ -354,7 +354,7 @@ def test_strm_worker_direct_mongo_uses_staging_and_virtual_destination(tmp_path,
         set(), direct_mongo=True,
     )
 
-    assert captured["target"].parent == (tmp_path / "staging" / "strm").resolve()
+    assert captured["target"].parent == (tmp_path / "staging" / "Filmes" / "Movie (2026)").resolve()
     assert captured["source"] == captured["target"]
     assert captured["destination"] == tmp_path / "virtual" / "Filmes" / "Movie (2026)" / "Movie (2026).mp4"
 
@@ -537,6 +537,50 @@ def test_iter_files_by_priority_orders_movies_by_year_descending(tmp_path):
         "Filme 2024.strm",
         "Filme Antigo (1994).mp4",
         "Filme Sem Ano.strm",
+    ]
+
+
+def test_iter_files_by_priority_mulletaflix_order(tmp_path):
+    # Prioridade: Animações > Filmes > Séries > Doramas > Novelas > Porno (A–Z)
+    animacoes_dir = tmp_path / "Animações" / "One Piece" / "Season 19"
+    filmes_dir = tmp_path / "Filmes"
+    series_dir = tmp_path / "Series" / "Dark" / "Season 01"
+    doramas_dir = tmp_path / "Doramas" / "Goblin" / "Season 01"
+    novelas_dir = tmp_path / "Novelas" / "Renascer"
+    porno_dir = tmp_path / "Porno"
+
+    for d in [animacoes_dir, filmes_dir, series_dir, doramas_dir, novelas_dir, porno_dir]:
+        d.mkdir(parents=True)
+
+    (porno_dir / "Zebra.strm").write_text("http://stream/z", encoding="utf-8")
+    (porno_dir / "Alfa.strm").write_text("http://stream/a", encoding="utf-8")
+    (porno_dir / "Beta.strm").write_text("http://stream/b", encoding="utf-8")
+    (novelas_dir / "Renascer - S01E01.strm").write_text("http://stream/n1", encoding="utf-8")
+    (doramas_dir / "Goblin - S01E01.strm").write_text("http://stream/d1", encoding="utf-8")
+    (series_dir / "Dark - S01E01.strm").write_text("http://stream/s1", encoding="utf-8")
+    (filmes_dir / "Filme B (2024).strm").write_text("http://stream/f24", encoding="utf-8")
+    (filmes_dir / "Filme A (2026).strm").write_text("http://stream/f26", encoding="utf-8")
+    (animacoes_dir / "One Piece - S19E37.strm").write_text("http://stream/op", encoding="utf-8")
+
+    results = list(feed_ftp.iter_files_by_priority([tmp_path], all_files=False, exclude_dirs=set()))
+    names = [src.name for _, src in results]
+
+    assert names == [
+        # 1. Animações
+        "One Piece - S19E37.strm",
+        # 2. Filmes (ano decrescente)
+        "Filme A (2026).strm",
+        "Filme B (2024).strm",
+        # 3. Séries
+        "Dark - S01E01.strm",
+        # 4. Doramas
+        "Goblin - S01E01.strm",
+        # 5. Novelas
+        "Renascer - S01E01.strm",
+        # 6. Porno (estritamente A-Z)
+        "Alfa.strm",
+        "Beta.strm",
+        "Zebra.strm",
     ]
 
 

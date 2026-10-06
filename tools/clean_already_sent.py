@@ -56,7 +56,7 @@ def get_completed_telegram_items(db) -> set[str]:
                 folder_name = parent.rstrip("/").split("/")[-1]
             else:
                 folder_name = dir_names.get(parent, "")
-            if folder_name and folder_name not in ("Filmes", "Series"):
+            if folder_name and folder_name.lower() not in ("filmes", "series", "porno", "animações", "animacoes", "doramas", "novelas"):
                 completed.add(normalize_string(str(folder_name)))
 
         # Add file stem

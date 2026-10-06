@@ -37,8 +37,12 @@ INCOMPLETE_RE = re.compile(
     r"(?i)(?P<download>.+\.download)(?:\.part\d+)?$|.+\.(?:partial|crdownload|aria2|tmp)$"
 )
 
-# Priority order for category processing
-CATEGORY_PRIORITY = ["filmes", "porno", "series"]
+# Priority order for category processing: Animações > Filmes > Séries > Doramas > Novelas > Porno (A–Z)
+CATEGORY_PRIORITY = ["animacoes", "filmes", "series", "doramas", "novelas", "porno"]
+
+
+def normalize_cat_token(text: str) -> str:
+    return unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode().lower()
 
 
 @dataclass
@@ -75,31 +79,44 @@ def extract_media_year(name: str, parent_name: str = "") -> int:
 
 
 def get_category_from_path(src: Path, source_root: Path) -> str | None:
-    """Extract category (filmes/porno/series) from file path relative to source root."""
+    """Extract category (animacoes/filmes/series/doramas/novelas/porno) from file path relative to source root."""
     try:
         rel = src.relative_to(source_root)
-        parts = [p.lower() for p in rel.parts]
+        parts = [normalize_cat_token(p) for p in rel.parts]
         for p in parts:
+            if any(k in p for k in ["animac", "anime"]):
+                return "animacoes"
             if any(k in p for k in ["filme", "movie"]):
                 return "filmes"
+            if any(k in p for k in ["dorama", "kdrama", "k-drama"]):
+                return "doramas"
+            if any(k in p for k in ["novela", "soap"]):
+                return "novelas"
             if any(k in p for k in ["porno", "porn", "xxx", "hentai", "adulto"]):
                 return "porno"
-            if any(k in p for k in ["serie", "tv", "show", "anime", "season"]):
+            if any(k in p for k in ["serie", "season"]) or p in ("tv", "show"):
                 return "series"
     except ValueError:
         pass
-    src_str = str(src).lower()
-    if any(k in src_str for k in ["\\filmes\\", "/filmes/", "filme"]):
+
+    src_str = normalize_cat_token(str(src))
+    if any(k in src_str for k in ["animac", "anime"]):
+        return "animacoes"
+    if any(k in src_str for k in ["\\filmes\\", "/filmes/", "filme", "movie"]):
         return "filmes"
-    if any(k in src_str for k in ["\\porno\\", "/porno/", "porn", "xxx", "adulto"]):
+    if any(k in src_str for k in ["\\doramas\\", "/doramas/", "dorama", "kdrama", "k-drama"]):
+        return "doramas"
+    if any(k in src_str for k in ["\\novelas\\", "/novelas/", "novela", "soap"]):
+        return "novelas"
+    if any(k in src_str for k in ["\\porno\\", "/porno/", "porn", "xxx", "hentai", "adulto"]):
         return "porno"
-    if any(k in src_str for k in ["\\series\\", "/series/", "serie", "season"]):
+    if any(k in src_str for k in ["\\series\\", "/series/", "serie", "season"]) or "\\tv\\" in src_str or "/tv/" in src_str:
         return "series"
     return None
 
 
 def iter_files_by_priority(sources: list[Path], all_files: bool, exclude_dirs: set[str]):
-    """Yield files grouped by priority: Filmes (ano decrescente: 2026 -> 2025 -> ...) -> Porno -> Series."""
+    """Yield files grouped by priority: Animações > Filmes > Séries > Doramas > Novelas > Porno (A–Z) -> other."""
     # Collect all files first with their category
     categorized: dict[str, list[tuple[Path, Path]]] = {cat: [] for cat in CATEGORY_PRIORITY}
     categorized["other"] = []
@@ -121,13 +138,49 @@ def iter_files_by_priority(sources: list[Path], all_files: bool, exclude_dirs: s
                     else:
                         categorized["other"].append((source, src))
     
-    # Ordenar filmes por ano da midia em ordem decrescente (ex: 2026 -> 2025 -> 2024 -> ...)
+    # 1. Animações: Séries/Episódios ordenados por temporada/episódio, filmes por ano decrescente, outros A-Z
+    def animacoes_sort_key(item: tuple[Path, Path]):
+        src_path = item[1]
+        ep_info = episode_identity(src_path.parent.name, src_path.name)
+        if ep_info:
+            return (0, ep_info[0], ep_info[1], ep_info[2])
+        year = extract_media_year(src_path.name, src_path.parent.name)
+        if year > 0:
+            return (1, "", -year, src_path.name.lower())
+        return (2, src_path.name.lower(), 0, 0)
+
+    categorized["animacoes"].sort(key=animacoes_sort_key)
+
+    # 2. Filmes por ano da mídia em ordem decrescente (ex: 2026 -> 2025 -> 2024 -> ...), desempate por nome A-Z
     categorized["filmes"].sort(
         key=lambda item: (
             -extract_media_year(item[1].name, item[1].parent.name),
-            item[1].name.lower()
+            item[1].name.lower(),
         )
     )
+
+    # Função auxiliar para ordenação de séries/doramas/novelas por temporada e episódio
+    def series_sort_key(item: tuple[Path, Path]):
+        src_path = item[1]
+        ep_info = episode_identity(src_path.parent.name, src_path.name)
+        if ep_info:
+            return (ep_info[0], ep_info[1], ep_info[2])
+        return (src_path.parent.name.lower(), src_path.name.lower(), 0)
+
+    # 3. Séries por nome, temporada e episódio
+    categorized["series"].sort(key=series_sort_key)
+
+    # 4. Doramas por nome, temporada e episódio
+    categorized["doramas"].sort(key=series_sort_key)
+
+    # 5. Novelas por nome, temporada e episódio
+    categorized["novelas"].sort(key=series_sort_key)
+
+    # 6. Porno ordenado estritamente A-Z
+    categorized["porno"].sort(key=lambda item: item[1].name.lower())
+
+    # Outros ordenados A-Z
+    categorized["other"].sort(key=lambda item: item[1].name.lower())
 
     # Yield in priority order
     for cat in CATEGORY_PRIORITY:
@@ -646,8 +699,12 @@ def strm_worker(
             if direct_mongo:
                 needed_size = remote_content_size(url)
                 stage_root = get_best_staging_root(required_bytes=needed_size)
-                clean_name = destination.name if destination else media_source.name
-                direct_target = stage_root / "strm" / clean_name
+                try:
+                    rel_dest = destination.relative_to(dest_root)
+                    direct_target = stage_root / rel_dest
+                except Exception:
+                    clean_name = destination.name if destination else media_source.name
+                    direct_target = stage_root / clean_name
                 wait_for_disk_capacity(
                     direct_target,
                     needed_size,

@@ -211,7 +211,20 @@ def worker(f):
         try: await f(cls, connection, rest)
         except CancelledError: connection.response("426", "transfer aborted"); connection.response("226", "abort successful")
         except Exception as exc:
-            logger.debug("worker failed: %s", exc)
+            # rclone/WinFsp can cancel or reopen a range read while the server
+            # is writing to the FTP data socket. This is a normal data-channel
+            # disconnect, not an unexpected server failure.
+            if (
+                isinstance(exc, (ConnectionResetError, BrokenPipeError))
+                or getattr(exc, "winerror", None) in (64, 10054)
+            ):
+                logger.info("FTP data connection closed by client (%s %s): %s", f.__name__, rest, exc)
+                try:
+                    connection.response("426", "data connection closed")
+                except Exception:
+                    pass
+                return
+            logger.exception("FTP transfer worker failed (%s %s)", f.__name__, rest)
             connection.response("451", "transfer error")
     return wrapper
 

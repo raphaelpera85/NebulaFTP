@@ -123,9 +123,9 @@ $ftpPort = 2122
 if ($env:PORT) {
   [int]::TryParse($env:PORT, [ref]$ftpPort) | Out-Null
 } elseif (Test-Path ".\rclone-nebula.conf") {
-  $confContent = Get-Content ".\rclone-nebula.conf"
-  if ($confContent -match "port\s*=\s*(\d+)") {
-    $ftpPort = [int]$matches[1]
+  $portSetting = Select-String -Path ".\rclone-nebula.conf" -Pattern '^\s*port\s*=\s*(\d+)\s*$' | Select-Object -First 1
+  if ($portSetting -and $portSetting.Matches.Count -gt 0) {
+    $ftpPort = [int]$portSetting.Matches[0].Groups[1].Value
   }
 }
 
@@ -142,13 +142,20 @@ while ((Get-Date) -lt $deadline) {
 }
 
 $configFile = (Resolve-Path ".\rclone-nebula.conf").Path
+$libraryUser = "raphael"
+$libraryUserSetting = Select-String -Path ".\.env" -Pattern '^\s*NEBULA_LIBRARY_USER\s*=\s*(.*?)\s*$' -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($libraryUserSetting -and $libraryUserSetting.Matches.Count -gt 0) {
+  $libraryUser = $libraryUserSetting.Matches[0].Groups[1].Value.Trim().Trim('"').Trim("'").Trim('/')
+}
+$excludeUserAlias = "/$libraryUser/**"
 $rcloneLog = Join-Path ([System.IO.Path]::GetTempPath()) "rclone-mount.log"
 & $rclone mount nebula:/ "$($targetDrive):" `
   --config "$configFile" `
+  --exclude "$excludeUserAlias" `
   --read-only `
   --vfs-cache-mode full `
   --vfs-cache-max-size 5G `
-  --vfs-cache-max-age 5m `
+  --vfs-cache-max-age 15m `
   --vfs-cache-poll-interval 30s `
   --dir-cache-time 10s `
   --poll-interval 0 `

@@ -1098,15 +1098,17 @@ class NebulaGUI:
             self.root.after(0, self.log, "Unidade N: já está montada.")
             return
         config_path = os.path.join(APP_DIR, "rclone-nebula.conf")
+        library_user = os.environ.get("NEBULA_LIBRARY_USER", "raphael").strip("/")
         cmd = [
             rclone, "mount", "nebula:/", "N:",
             "--config", config_path,
+            "--exclude", f"/{library_user}/**",
             "--read-only",
             "--vfs-cache-mode", "full",
             "--vfs-cache-max-size", "5G",
-            "--vfs-cache-max-age", "5m",
+            "--vfs-cache-max-age", "15m",
             "--vfs-cache-poll-interval", "30s",
-            "--dir-cache-time", "30s",
+            "--dir-cache-time", "10s",
             "--poll-interval", "0",
             "--links",
             "--no-checksum",

@@ -47,6 +47,15 @@ except (ImportError, RuntimeError, OSError):
 logger = logging.getLogger("NebulaFTP")
 STREAM_BOT_CURSOR = count()
 
+VISIBLE_CATEGORY_ROOTS = frozenset({
+    "filmes", "filme", "movies", "movie",
+    "series", "serie", "série",
+    "novelas", "novela", "telenovelas", "telenovela",
+    "doramas", "dorama", "k-drama", "kdrama", "c-drama", "cdrama", "j-drama", "jdrama",
+    "animacao", "animação", "animacoes", "animações", "animation", "animations", "anime", "animes",
+    "porno", "porn", "adulto", "hentai", "erotico", "erótico", "xxx",
+})
+
 __all__ = (
     "AbstractPathIO", "PathIONursery", "MongoDBPathIO", "BoundedLRUCache",
     "is_uploadable_name", "movie_folder_score", "resolve_part_bot", "resolve_part_bots",
@@ -193,16 +202,18 @@ def resolve_part_bots(part, tg):
 
 
 async def reserve_free_stream_bot(candidates):
-    """Reserve the first idle bot without interrupting active work."""
+    """Reserve a bot for streaming, giving playback priority over uploads.
+
+    Uploads wait for active streams, so the reverse must not be true: waiting
+    for a long Telegram upload can stall a mounted-drive read for minutes.
+    Pyrogram can perform the upload and GetFile request concurrently.
+    """
     while candidates:
         for bot in candidates:
-            uploads = getattr(bot, "_nebula_uploads", 0)
             streams = getattr(bot, "_nebula_streams", 0)
-            if not isinstance(uploads, int):
-                uploads = 0
             if not isinstance(streams, int):
                 streams = 0
-            if uploads == 0 and streams == 0:
+            if streams == 0:
                 # No await between the check and increment: this reservation is
                 # atomic with respect to other tasks on the asyncio event loop.
                 bot._nebula_streams = 1
@@ -357,22 +368,34 @@ class MongoDBMemoryIO:
 
         if File is None:
             logger.error("Cannot stream from Telegram: pyrogram/tgcrypto not installed")
-            return
+            raise OSError("Telegram streaming support is unavailable")
         parts = self._node.parts
-        if not parts: return
+        if not parts:
+            if self._node.size:
+                raise OSError(f"No Telegram parts are recorded for {self._node.name!r}")
+            return
         parts.sort(key=lambda x: x["part_id"])
         current_file_pos = 0; start_read_at = self.offset
 
         for part in parts:
             part_size = part.get("file_size", 2 * 1024 * 1024 * 1024)
+            expected_part_size = (
+                part_size if isinstance(part_size, int) and part_size > 0 else None
+            )
             part_end = current_file_pos + part_size
             if part_end <= start_read_at: current_file_pos += part_size; continue
             local_offset = max(0, start_read_at - current_file_pos)
+            expected_read_size = (
+                expected_part_size - local_offset
+                if expected_part_size is not None
+                else None
+            )
             candidates = resolve_part_bots(part, self._tg)
             if not candidates:
                 logger.error("Cannot stream from Telegram: no bot clients configured")
-                return
+                raise OSError("No Telegram bot clients are configured")
             streamed = False
+            streamed_bytes = 0
             remaining_candidates = list(candidates)
             while remaining_candidates:
                 tg = await reserve_free_stream_bot(remaining_candidates)
@@ -434,6 +457,7 @@ class MongoDBMemoryIO:
                                 bot_number,
                             )
                         streamed = True
+                        streamed_bytes += len(chunk)
                         yield chunk
                 finally:
                     tg._nebula_streams = max(0, getattr(tg, "_nebula_streams", 1) - 1)
@@ -446,8 +470,15 @@ class MongoDBMemoryIO:
                     bot_number,
                 )
             if not streamed:
-                logger.error("Cannot stream Telegram part %s with configured bot indexes", part.get("part_id"))
-                return
+                raise OSError(
+                    f"Telegram part {part.get('part_id')} of {self._node.name!r} "
+                    "could not be read from any configured bot"
+                )
+            if expected_read_size is not None and streamed_bytes != expected_read_size:
+                raise OSError(
+                    f"Telegram part {part.get('part_id')} of {self._node.name!r} "
+                    f"was truncated ({streamed_bytes}/{expected_read_size} bytes)"
+                )
             current_file_pos += part_size; start_read_at = current_file_pos
 
 class MongoDBPathIO(AbstractPathIO):
@@ -483,6 +514,68 @@ class MongoDBPathIO(AbstractPathIO):
         if p_str != "/" and p_str.endswith("/"): p_str = p_str[:-1]
         return os.path.dirname(p_str), os.path.basename(p_str)
 
+    @staticmethod
+    def _has_telegram_payload(doc):
+        parts = doc.get("parts")
+        if isinstance(parts, list) and parts:
+            return all(
+                isinstance(part, dict)
+                and any(isinstance(part.get(key), str) and part[key].strip() for key in ("tg_file_id", "tg_file"))
+                for part in parts
+            )
+        return any(isinstance(doc.get(key), str) and doc[key].strip() for key in ("tg_file_id", "tg_file"))
+
+    @staticmethod
+    def _is_directory_doc(doc):
+        return doc.get("is_directory") is True or doc.get("type") == "dir"
+
+    @staticmethod
+    def _is_library_root(path):
+        user_root = "/" + environ.get("NEBULA_LIBRARY_USER", "raphael").strip("/")
+        return path == "/" or path.casefold() == user_root.casefold()
+
+    async def _has_published_descendant(self, path):
+        normalized = path.rstrip("/") or "/"
+        user_root = "/" + environ.get("NEBULA_LIBRARY_USER", "raphael").strip("/")
+        variants = {normalized}
+        if normalized.casefold().startswith(user_root.casefold() + "/"):
+            variants.add(normalized[len(user_root):])
+        elif normalized != "/":
+            variants.add(user_root + normalized)
+
+        parents = []
+        for variant in variants:
+            parents.append({"parent": variant})
+            parents.append({"parent": {"$regex": "^" + re.escape(variant.rstrip("/") + "/")}})
+        cursor = self._files.find(
+            {
+                "$or": parents,
+                "parts": {"$exists": True, "$ne": []},
+            },
+            {"_id": 1},
+        ).limit(1)
+        return bool(await cursor.to_list(length=1))
+
+    async def _is_visible_listing_doc(self, parent, doc):
+        name = doc.get("name", "")
+        if not name or name.casefold().endswith(".partial"):
+            return False
+
+        is_directory = self._is_directory_doc(doc)
+        if not is_directory:
+            return self._has_telegram_payload(doc)
+
+        is_root = self._is_library_root(parent)
+        if is_root and name.casefold() == "strm":
+            return False
+        user_name = environ.get("NEBULA_LIBRARY_USER", "raphael").strip("/")
+        if is_root and name.casefold() == user_name.casefold():
+            return False
+        if not is_root and name.casefold() in VISIBLE_CATEGORY_ROOTS:
+            return False
+        child_path = (parent.rstrip("/") + "/" + name) if parent != "/" else "/" + name
+        return await self._has_published_descendant(child_path)
+
     async def get_node(self, path):
         if str(path) in ("/", "."): return Node("dir", "", 0, 0, size=0, parent="/")
         parent, name = self._split_path(path)
@@ -490,13 +583,31 @@ class MongoDBPathIO(AbstractPathIO):
 
         async with self._cache_lock:
             if cache_key in self._memory_cache:
-                return Node(**self._memory_cache[cache_key])
+                cached = dict(self._memory_cache[cache_key])
+                cached["parent"] = parent
+                return Node(**cached)
 
         if self.db is None:
             return None
 
+        # MulletaFlix stores some directory children with parent=<directory
+        # ObjectId>, while the original Nebula historically stored a path
+        # string. Resolve both schemas so stat/open works for either library.
+        if parent not in ("", "/"):
+            parent_node = await self.get_node(PurePosixPath(parent))
+            if parent_node is not None and parent_node.id is not None:
+                node = await self._files.find_one({"name": name, "parent": parent_node.id})
+                if node:
+                    node = dict(node)
+                    node["parent"] = parent
+                    async with self._cache_lock:
+                        self._memory_cache[cache_key] = node
+                    return Node(**node)
+
         node = await self._files.find_one({"name": name, "parent": parent})
         if node:
+            node = dict(node)
+            node["parent"] = parent
             async with self._cache_lock: self._memory_cache[cache_key] = node
             return Node(**node)
             
@@ -505,6 +616,8 @@ class MongoDBPathIO(AbstractPathIO):
             alt = parent[1:]
             node = await self._files.find_one({"name": name, "parent": alt})
             if node:
+                node = dict(node)
+                node["parent"] = parent
                 async with self._cache_lock: self._memory_cache[cache_key] = node
                 return Node(**node)
         return None
@@ -599,11 +712,54 @@ class MongoDBPathIO(AbstractPathIO):
             @universal_exception
             async def __anext__(cls):
                 if cls.iter is None:
-                    cls.iter = self._files.find({"parent": search, "name": {"$not": {"$regex": r"\.partial$"}}})
+                    docs_by_name = {}
+                    queries = [{"parent": search}]
+                    directory_node = await self.get_node(path)
+                    if directory_node is not None and directory_node.id is not None:
+                        queries.append({"parent": directory_node.id})
+                    for query in queries:
+                        async for doc in self._files.find(query):
+                            name = doc.get("name", "")
+                            key = name.casefold() if isinstance(name, str) else ""
+                            if (
+                                not key
+                                or key.endswith(".partial")
+                                or not await self._is_visible_listing_doc(search, doc)
+                            ):
+                                continue
+                            current = docs_by_name.get(key)
+                            if current is None:
+                                docs_by_name[key] = doc
+                            else:
+                                candidate_score = (
+                                    2 * int(doc.get("status") == "completed" and self._has_telegram_payload(doc))
+                                    + int(self._is_directory_doc(doc))
+                                )
+                                current_score = (
+                                    2 * int(current.get("status") == "completed" and self._has_telegram_payload(current))
+                                    + int(self._is_directory_doc(current))
+                                )
+                                if candidate_score > current_score:
+                                    docs_by_name[key] = doc
+                    visible = []
+                    for doc in docs_by_name.values():
+                        name = doc.get("name", "")
+                        # Reuse the exact Mongo document used to construct
+                        # this listing entry. Looking it up again in stat()
+                        # can fail for names whose Unicode form differs
+                        # between MongoDB and PurePosixPath normalization.
+                        cache_name = self._sanitize(name)
+                        cache_parent = self._sanitize(search)
+                        cache_doc = dict(doc)
+                        cache_doc["parent"] = cache_parent
+                        async with self._cache_lock:
+                            self._memory_cache[f"{cache_parent}::{cache_name}"] = cache_doc
+                        visible.append(path / name)
+                    cls.iter = iter(visible)
                 try:
-                    doc = await cls.iter.__anext__()
-                    return path / doc["name"]
-                except StopAsyncIteration: raise
+                    return next(cls.iter)
+                except StopIteration:
+                    raise StopAsyncIteration
         return Lister()
 
     @universal_exception

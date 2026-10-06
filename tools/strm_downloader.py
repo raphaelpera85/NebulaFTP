@@ -65,8 +65,8 @@ def is_incomplete_filename(name: str) -> bool:
         or name_lower.endswith(".crdownload")
     )
 
-# Prioridade de categorias padrão do Nebula
-CATEGORY_PRIORITY = ["filmes", "porno", "series"]
+# Prioridade de categorias do Nebula: Animações > Filmes > Séries > Doramas > Novelas > Porno (A–Z)
+CATEGORY_PRIORITY = ["animacoes", "filmes", "series", "doramas", "novelas", "porno"]
 
 logger = logging.getLogger("STRMDownloader")
 
@@ -154,25 +154,37 @@ def episode_identity(series_name: str, filename: str) -> tuple[str, int, int] | 
 
 
 def get_category_from_path(src: Path, source_root: Path) -> str:
-    """Determina a categoria da mídia (filmes/porno/series/outros)."""
+    """Determina a categoria da mídia (animacoes/filmes/series/doramas/novelas/porno/other)."""
     try:
         rel = src.relative_to(source_root)
-        parts = [p.lower() for p in rel.parts]
+        parts = [unicodedata.normalize("NFKD", p).encode("ascii", "ignore").decode().lower() for p in rel.parts]
         for p in parts:
+            if any(k in p for k in ["animac", "anime"]):
+                return "animacoes"
             if any(k in p for k in ["filme", "movie"]):
                 return "filmes"
+            if any(k in p for k in ["dorama", "kdrama", "k-drama"]):
+                return "doramas"
+            if any(k in p for k in ["novela", "soap"]):
+                return "novelas"
             if any(k in p for k in ["porno", "porn", "xxx", "hentai", "adulto"]):
                 return "porno"
-            if any(k in p for k in ["serie", "tv", "show", "anime", "season"]):
+            if any(k in p for k in ["serie", "season"]) or p in ("tv", "show"):
                 return "series"
     except ValueError:
         pass
-    src_str = str(src).lower()
-    if any(k in src_str for k in ["\\filmes\\", "/filmes/", "filme"]):
+    src_str = unicodedata.normalize("NFKD", str(src)).encode("ascii", "ignore").decode().lower()
+    if any(k in src_str for k in ["animac", "anime"]):
+        return "animacoes"
+    if any(k in src_str for k in ["\\filmes\\", "/filmes/", "filme", "movie"]):
         return "filmes"
-    if any(k in src_str for k in ["\\porno\\", "/porno/", "porn", "xxx", "adulto"]):
+    if any(k in src_str for k in ["\\doramas\\", "/doramas/", "dorama", "kdrama", "k-drama"]):
+        return "doramas"
+    if any(k in src_str for k in ["\\novelas\\", "/novelas/", "novela", "soap"]):
+        return "novelas"
+    if any(k in src_str for k in ["\\porno\\", "/porno/", "porn", "xxx", "hentai", "adulto"]):
         return "porno"
-    if any(k in src_str for k in ["\\series\\", "/series/", "serie", "season"]):
+    if any(k in src_str for k in ["\\series\\", "/series/", "serie", "season"]) or "\\tv\\" in src_str or "/tv/" in src_str:
         return "series"
     return "other"
 
@@ -970,12 +982,25 @@ def iter_strm_files_prioritized(
                 else:
                     categorized["other"].append(item)
 
-    # 1. Ordenação de Filmes: Ano mais recente primeiro (ex: 2026 -> 2025), desempate por nome
+    # 1. Animações: Séries/Episódios ordenados por temporada/episódio, filmes por ano decrescente, outros A-Z
+    def animacoes_sort_key(it: tuple[Path, Path, str, int]):
+        src_path = it[1]
+        ep_info = episode_identity(src_path.parent.name, src_path.name)
+        if ep_info:
+            return (0, ep_info[0], ep_info[1], ep_info[2])
+        year = it[3]
+        if year > 0:
+            return (1, "", -year, src_path.name.lower())
+        return (2, src_path.name.lower(), 0, 0)
+
+    categorized["animacoes"].sort(key=animacoes_sort_key)
+
+    # 2. Ordenação de Filmes: Ano mais recente primeiro (ex: 2026 -> 2025), desempate por nome A-Z
     categorized["filmes"].sort(
         key=lambda it: (-it[3], it[1].name.lower())
     )
 
-    # 2. Ordenação de Séries: Nome da pasta/série, temporada e episódio
+    # Função auxiliar para ordenação de séries/doramas/novelas por temporada e episódio
     def series_sort_key(it: tuple[Path, Path, str, int]):
         src_path = it[1]
         ep_info = episode_identity(src_path.parent.name, src_path.name)
@@ -983,7 +1008,20 @@ def iter_strm_files_prioritized(
             return (ep_info[0], ep_info[1], ep_info[2])
         return (src_path.parent.name.lower(), src_path.name.lower(), 0)
 
+    # 3. Séries por nome da pasta/série, temporada e episódio
     categorized["series"].sort(key=series_sort_key)
+
+    # 4. Doramas por nome da pasta/série, temporada e episódio
+    categorized["doramas"].sort(key=series_sort_key)
+
+    # 5. Novelas por nome da pasta/série, temporada e episódio
+    categorized["novelas"].sort(key=series_sort_key)
+
+    # 6. Porno ordenado estritamente A-Z
+    categorized["porno"].sort(key=lambda it: it[1].name.lower())
+
+    # Outros ordenados A-Z
+    categorized["other"].sort(key=lambda it: it[1].name.lower())
 
     # Monta a fila combinada por prioridade
     results: list[tuple[Path, Path, str, int]] = []
@@ -1177,7 +1215,12 @@ def process_strm_item(
                 return False
 
             best_stage = get_best_staging_root(staging_dirs, remote_size, min_free_percent)
-            target_stage_file = best_stage / "strm" / destination.name
+            try:
+                rel_dest = destination.relative_to(dest_root)
+                target_stage_file = best_stage / rel_dest
+            except Exception:
+                target_stage_file = best_stage / destination.name
+            target_stage_file.parent.mkdir(parents=True, exist_ok=True)
 
             logger.info(
                 "[1 MÍDIA POR VEZ] Iniciando download: %s [%s%s] -> Stage: %s",
@@ -1247,7 +1290,12 @@ def process_strm_item(
             # 2. Obter tamanho do arquivo local e alocar melhor pasta de stage
             file_size = strm_path.stat().st_size
             best_stage = get_best_staging_root(staging_dirs, file_size, min_free_percent)
-            target_stage_file = best_stage / "strm" / destination.name
+            try:
+                rel_dest = destination.relative_to(dest_root)
+                target_stage_file = best_stage / rel_dest
+            except Exception:
+                target_stage_file = best_stage / destination.name
+            target_stage_file.parent.mkdir(parents=True, exist_ok=True)
 
             logger.info(
                 "[1 MÍDIA POR VEZ] Mídia pronta detectada: %s [%s%s] -> Movendo para Stage: %s",

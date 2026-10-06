@@ -1202,12 +1202,10 @@ async def staging_scanner(mongo, staging_dirs):
                             try:
                                 rel = file_path.relative_to(stage_path)
                                 parts = list(rel.parts)
-                                if len(parts) >= 2 and parts[0] in ("Filmes", "Series", "Porno"):
+                                if len(parts) >= 2 and parts[0] in ("Filmes", "Series", "Porno", "Animações", "Animacoes", "Doramas", "Novelas"):
                                     if parts[0] == "Filmes" and len(parts) >= 3:
                                         inferred_name = f"{parts[1]}{file_path.suffix}"
-                                    elif parts[0] == "Series" and len(parts) >= 3:
-                                        inferred_name = file_path.name
-                                    elif parts[0] == "Porno":
+                                    else:
                                         inferred_name = file_path.name
                             except (ValueError, IndexError):
                                 pass
