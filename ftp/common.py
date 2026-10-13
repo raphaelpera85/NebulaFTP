@@ -1,170 +1,56 @@
-import asyncio
-import os
-from asyncio import IncompleteReadError, Queue, QueueEmpty
+from asyncio import IncompleteReadError, Queue
 from contextlib import contextmanager
 from locale import LC_ALL
 from locale import setlocale as _setlocale
 from threading import Lock
 
-DEFAULT_SMALL_FILE_MAX_BYTES = int(os.environ.get("SMALL_FILE_MAX_MB", "50")) * 1024 * 1024
 
+class UploadQueue:
+    """FIFO upload queue, compatible with ``asyncio.Queue``.
 
-class DualLaneUploadQueue:
-    """Fila de upload com faixas dedicadas para arquivos pequenos (fast lane) e grandes.
-
-    Totalmente compatível com a interface de asyncio.Queue.
+    MongoDB remains the persistent source of truth. This queue only
+    coordinates items already atomically claimed for the current process.
     """
 
-    def __init__(self, small_file_max_bytes: int | None = None):
-        self._small_queue: Queue = Queue()
-        self._large_queue: Queue = Queue()
-        self._unfinished_tasks = 0
-        self._finished = asyncio.Event()
-        self._finished.set()
-        self._has_item = asyncio.Event()
-        self._small_file_max_bytes = (
-            small_file_max_bytes
-            if small_file_max_bytes is not None
-            else DEFAULT_SMALL_FILE_MAX_BYTES
-        )
-
-    @property
-    def small_file_max_bytes(self) -> int:
-        return self._small_file_max_bytes
-
-    @small_file_max_bytes.setter
-    def small_file_max_bytes(self, val: int) -> None:
-        self._small_file_max_bytes = val
-
-    def is_small(self, item: dict) -> bool:
-        if not isinstance(item, dict):
-            return False
-        size = item.get("size")
-        if size is None and "path" in item:
-            try:
-                if os.path.exists(item["path"]):
-                    size = os.path.getsize(item["path"])
-            except OSError:
-                size = 0
-        return (size or 0) <= self._small_file_max_bytes
+    def __init__(self):
+        self._queue: Queue = Queue()
 
     async def put(self, item: dict) -> None:
-        self._unfinished_tasks += 1
-        self._finished.clear()
-        if self.is_small(item):
-            await self._small_queue.put(item)
-        else:
-            await self._large_queue.put(item)
-        self._has_item.set()
+        await self._queue.put(item)
 
     def put_nowait(self, item: dict) -> None:
-        self._unfinished_tasks += 1
-        self._finished.clear()
-        if self.is_small(item):
-            self._small_queue.put_nowait(item)
-        else:
-            self._large_queue.put_nowait(item)
-        self._has_item.set()
-
-    async def get_small(self) -> dict:
-        """Retira item da faixa rápida (arquivos pequenos)."""
-        item = await self._small_queue.get()
-        if self.empty():
-            self._has_item.clear()
-        return item
-
-    async def get_large(self, fallback_to_small: bool = True) -> dict:
-        """Retira item da faixa de arquivos grandes (ou recorre aos pequenos se vazio)."""
-        while True:
-            if not self._large_queue.empty():
-                try:
-                    item = self._large_queue.get_nowait()
-                    if self.empty():
-                        self._has_item.clear()
-                    return item
-                except QueueEmpty:
-                    pass
-            if fallback_to_small and not self._small_queue.empty():
-                try:
-                    item = self._small_queue.get_nowait()
-                    if self.empty():
-                        self._has_item.clear()
-                    return item
-                except QueueEmpty:
-                    pass
-            self._has_item.clear()
-            await self._has_item.wait()
+        self._queue.put_nowait(item)
 
     async def get(self) -> dict:
-        """Retira item priorizando arquivos pequenos para esvaziar a fila rapidamente."""
-        while True:
-            if not self._small_queue.empty():
-                try:
-                    item = self._small_queue.get_nowait()
-                    if self.empty():
-                        self._has_item.clear()
-                    return item
-                except QueueEmpty:
-                    pass
-            if not self._large_queue.empty():
-                try:
-                    item = self._large_queue.get_nowait()
-                    if self.empty():
-                        self._has_item.clear()
-                    return item
-                except QueueEmpty:
-                    pass
-            self._has_item.clear()
-            await self._has_item.wait()
+        return await self._queue.get()
 
     def get_nowait(self) -> dict:
-        if not self._small_queue.empty():
-            item = self._small_queue.get_nowait()
-            if self.empty():
-                self._has_item.clear()
-            return item
-        if not self._large_queue.empty():
-            item = self._large_queue.get_nowait()
-            if self.empty():
-                self._has_item.clear()
-            return item
-        raise QueueEmpty()
+        return self._queue.get_nowait()
 
     def task_done(self) -> None:
-        if self._unfinished_tasks <= 0:
-            raise ValueError("task_done() called too many times")
-        self._unfinished_tasks -= 1
-        if self._unfinished_tasks == 0:
-            self._finished.set()
+        self._queue.task_done()
 
     def empty(self) -> bool:
-        return self._small_queue.empty() and self._large_queue.empty()
+        return self._queue.empty()
 
     def qsize(self) -> int:
-        return self._small_queue.qsize() + self._large_queue.qsize()
-
-    def small_qsize(self) -> int:
-        return self._small_queue.qsize()
-
-    def large_qsize(self) -> int:
-        return self._large_queue.qsize()
+        return self._queue.qsize()
 
     async def join(self) -> None:
-        if self._unfinished_tasks > 0:
-            await self._finished.wait()
+        await self._queue.join()
 
 
-# Fila Global de Upload com faixas dedicadas
-UPLOAD_QUEUE = DualLaneUploadQueue()
+UPLOAD_QUEUE = UploadQueue()
 
 __all__ = (
     "StreamIO",
     "wrap_with_container",
     "AbstractAsyncLister",
     "setlocale",
-    "DualLaneUploadQueue",
+    "UploadQueue",
     "UPLOAD_QUEUE",
 )
+
 
 class AsyncStreamIterator:
     def __init__(self, read_coro):
@@ -177,8 +63,8 @@ class AsyncStreamIterator:
         data = await self.read_coro()
         if data:
             return data
-        else:
-            raise StopAsyncIteration
+        raise StopAsyncIteration
+
 
 class AbstractAsyncLister:
     async def _to_list(self):
@@ -193,10 +79,12 @@ class AbstractAsyncLister:
     def __await__(self):
         return self._to_list().__await__()
 
+
 def wrap_with_container(o):
     if isinstance(o, str):
         o = (o,)
     return o
+
 
 class StreamIO:
     def __init__(self, reader, writer):
@@ -223,7 +111,7 @@ class StreamIO:
         self.writer.close()
 
     async def __aenter__(self):
-        pass
+        return self
 
     async def __aexit__(self, *args, **kwargs):
         self.close()
@@ -231,7 +119,9 @@ class StreamIO:
     def iter_by_block(self, count=8192):
         return AsyncStreamIterator(lambda: self.readexactly(count))
 
+
 LOCALE_LOCK = Lock()
+
 
 @contextmanager
 def setlocale(name):

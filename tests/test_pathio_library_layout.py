@@ -96,3 +96,32 @@ def test_listing_keeps_only_complete_multi_part_payloads():
         "parts": [{"tg_file_id": "one"}, {}],
     })
     assert not MongoDBPathIO._has_telegram_payload({"parts": []})
+
+
+def test_directory_visibility_checks_run_concurrently_with_a_bound(monkeypatch):
+    documents = [
+        {"name": f"Folder-{index}", "parent": "/raphael", "type": "dir"}
+        for index in range(24)
+    ]
+    path_io = MongoDBPathIO()
+    path_io.db = _Database(documents)
+    active = 0
+    peak = 0
+
+    async def visible(_parent, _doc):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.005)
+        active -= 1
+        return True
+
+    monkeypatch.setattr(path_io, "_is_visible_listing_doc", visible)
+
+    async def list_paths():
+        return [str(path) async for path in path_io.list(PurePosixPath("/raphael"))]
+
+    paths = asyncio.run(list_paths())
+
+    assert len(paths) == 24
+    assert 1 < peak <= 8

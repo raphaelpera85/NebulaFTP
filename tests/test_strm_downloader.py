@@ -389,3 +389,176 @@ def test_failure_tracker_record_and_skip(tmp_path):
     should_skip3, _ = tracker2.should_skip(fake_strm)
     assert should_skip3 is False
 
+
+def test_find_existing_staging_target(tmp_path):
+    dest_root = tmp_path / "dest"
+    stage1 = tmp_path / "stage1"
+    stage2 = tmp_path / "stage2"
+    stage1.mkdir()
+    stage2.mkdir()
+
+    dest = dest_root / "Filmes" / "Filme A (2025)" / "Filme A (2025).mp4"
+
+    # Inicialmente não existe em nenhum stage
+    target, has_existing = strm_downloader.find_existing_staging_target(dest_root, dest, [stage1, stage2])
+    assert target is None
+    assert has_existing is False
+
+    # Cria download parcial no stage2 (simulando parada inesperada em sessão anterior)
+    stage2_movie_dir = stage2 / "Filmes" / "Filme A (2025)"
+    stage2_movie_dir.mkdir(parents=True)
+    part_file = stage2_movie_dir / ".Filme A (2025).download.part0"
+    part_file.write_bytes(b"partial-data")
+
+    target, has_existing = strm_downloader.find_existing_staging_target(dest_root, dest, [stage1, stage2])
+    assert has_existing is True
+    assert target == stage2 / "Filmes" / "Filme A (2025)" / "Filme A (2025).mp4"
+
+
+def test_failure_tracker_allows_interrupted_and_partial_downloads(tmp_path):
+    cache_file = tmp_path / "failures.json"
+    tracker = strm_downloader.FailureTracker(cache_file=cache_file, cooldown_seconds=3600)
+    fake_strm = tmp_path / "Filme Interrompido (2026).strm"
+    fake_strm.write_text("http://stream.example.com", encoding="utf-8")
+
+    # Erro transitório (interrupção inesperada, timeout, socket error)
+    tracker.record_failure(fake_strm, "Connection reset by peer")
+    # Tentativa 1: NÃO deve pular, permitindo retomar na próxima sessão
+    should_skip, _ = tracker.should_skip(fake_strm)
+    assert should_skip is False
+
+    # Tentativa 2
+    tracker.record_failure(fake_strm, "Timeout reading part 2")
+    should_skip, _ = tracker.should_skip(fake_strm)
+    assert should_skip is False
+
+    # Se atingir 3 tentativas, normalmente entraria em cooldown
+    tracker.record_failure(fake_strm, "Timeout reading part 3")
+    should_skip, reason = tracker.should_skip(fake_strm)
+    assert should_skip is True
+    assert "Timeout" in reason
+
+    # Mas se houver arquivos de download parcial no disco de stage, NUNCA pula (retoma a sessão!)
+    stage_dir = tmp_path / "stage"
+    stage_dir.mkdir()
+    partial = stage_dir / ".Filme Interrompido (2026).download.part0"
+    partial.write_bytes(b"data")
+    should_skip_resumed, _ = tracker.should_skip(fake_strm, staging_dirs=[stage_dir])
+    assert should_skip_resumed is False
+
+
+def test_download_strm_multipart_resumes_partial_part_file(tmp_path, monkeypatch):
+    target = tmp_path / "resumed_video.mp4"
+    data = b"0123456789" * 100  # 1000 bytes (4 partes de 250 bytes)
+    tmp_path_base = tmp_path / ".resumed_video.download"
+
+    # Pre-cria part0 completa (250 bytes) e part1 parcial (100 bytes) em .tmp
+    part0 = Path(f"{tmp_path_base}.part0")
+    part0.write_bytes(data[0:250])
+    part1_tmp = Path(f"{tmp_path_base}.part1.tmp")
+    part1_tmp.write_bytes(data[250:350])
+
+    requested_ranges = []
+
+    def mock_urlopen(request, timeout=20):
+        rng = request.headers.get("Range", "")
+        if rng == "bytes=0-0":
+            return _FakeHTTPResponse(b"0", headers={"Content-Range": f"bytes 0-0/{len(data)}"}, status=206)
+        if rng.startswith("bytes="):
+            start_str, end_str = rng.replace("bytes=", "").split("-")
+            start, end = int(start_str), int(end_str)
+            requested_ranges.append((start, end))
+            chunk = data[start:end + 1]
+            return _FakeHTTPResponse(chunk, headers={"Content-Length": str(len(chunk))}, status=206)
+        return _FakeHTTPResponse(data, headers={"Content-Length": str(len(data))}, status=200)
+
+    monkeypatch.setattr(strm_downloader, "urlopen", mock_urlopen)
+    monkeypatch.setattr(strm_downloader, "wait_for_disk_capacity", lambda *_args, **_kwargs: None)
+
+    res = strm_downloader.download_strm_multipart(
+        url="http://example.com/video.mp4",
+        target_path=target,
+        parts_count=4,
+        read_timeout=10,
+    )
+
+    assert res.exists()
+    assert res.read_bytes() == data
+    # part1 deve ter sido retomada a partir de 350 (250 + 100) ate 499!
+    assert (350, 499) in requested_ranges
+    # part0 já estava completa, portanto range 0-249 NÃO deve ter sido solicitado via HTTP
+    assert (0, 249) not in requested_ranges
+
+
+def test_gui_parse_downloader_lines_resume():
+    from unittest.mock import MagicMock
+    from gui import NebulaGUI
+
+    gui = NebulaGUI.__new__(NebulaGUI)
+    gui.dl_name_lbl = MagicMock()
+    gui.dl_meta_lbl = MagicMock()
+    gui.dl_pbar = {"value": 0}
+    gui.dl_pct_lbl = MagicMock()
+
+    resume_line = "[12:56:00][INFO][STRM] Resumindo Filme.mp4: 50.0 MB / 100.0 MB (50%) já no disco."
+    gui._parse_downloader_line(resume_line)
+
+    gui.dl_name_lbl.config.assert_called_with(text="Resumindo: Filme.mp4")
+    assert gui.dl_pbar["value"] == 50.0
+    gui.dl_pct_lbl.config.assert_called_with(text="50.0% (50.0 MB / 100.0 MB já no disco)")
+
+
+def test_format_download_error_http_406_asn_blocked():
+    from urllib.error import HTTPError
+    from io import BytesIO
+
+    headers = {
+        "X-Debug-ASNAllowed": "0",
+        "X-Debug-ASNOrg": "TELEFONICA BRASIL S.A",
+    }
+    err = HTTPError("http://example.com/stream.mkv", 406, "Not Acceptable", headers, BytesIO(b""))
+    formatted = strm_downloader.format_download_error(err)
+    assert "HTTP Error 406" in formatted
+    assert "TELEFONICA BRASIL S.A" in formatted
+    assert "VPN" in formatted
+
+
+def test_failure_tracker_circuit_breaker_on_repeated_fatal_errors(tmp_path):
+    cache_file = tmp_path / "failures.json"
+    tracker = strm_downloader.FailureTracker(cache_file=cache_file, cooldown_seconds=3600)
+
+    ep1 = tmp_path / "Animações" / "Os Simpsons" / "Season 01" / "Os Simpsons - S01E01.strm"
+    ep2 = tmp_path / "Animações" / "Os Simpsons" / "Season 01" / "Os Simpsons - S01E02.strm"
+    ep3 = tmp_path / "Animações" / "Os Simpsons" / "Season 01" / "Os Simpsons - S01E03.strm"
+    ep4 = tmp_path / "Animações" / "Os Simpsons" / "Season 01" / "Os Simpsons - S01E04.strm"
+    for ep in (ep1, ep2, ep3, ep4):
+        ep.parent.mkdir(parents=True, exist_ok=True)
+        ep.write_text("http://example.com", encoding="utf-8")
+
+    # Inicialmente nenhuma série está pausada
+    assert tracker.is_series_broken(ep1)[0] is False
+
+    # 1ª falha fatal
+    tracker.record_failure(ep1, "HTTP Error 406: Bloqueio de Operadora/ASN (TELEFONICA BRASIL S.A)")
+    assert tracker.is_series_broken(ep1)[0] is False
+
+    # 2ª falha fatal
+    tracker.record_failure(ep2, "HTTP Error 406: Bloqueio de Operadora/ASN (TELEFONICA BRASIL S.A)")
+    assert tracker.is_series_broken(ep1)[0] is False
+
+    # 3ª falha fatal -> deve disparar o circuit breaker para a série!
+    tracker.record_failure(ep3, "HTTP Error 406: Bloqueio de Operadora/ASN (TELEFONICA BRASIL S.A)")
+    is_broken, reason = tracker.is_series_broken(ep4)
+    assert is_broken is True
+    assert "Os Simpsons" in reason
+
+    # ep4 deve ser pulado automaticamente pelo should_skip sem precisar tentar requisição de rede
+    should_skip, skip_reason = tracker.should_skip(ep4)
+    assert should_skip is True
+    assert "Os Simpsons" in skip_reason
+
+    # Reset do ciclo deve limpar o circuit breaker
+    tracker.reset_cycle()
+    assert tracker.is_series_broken(ep4)[0] is False
+
+

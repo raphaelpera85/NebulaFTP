@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 from urllib.request import Request, urlopen
+import urllib.error
 
 from bson import ObjectId
 from dotenv import load_dotenv
@@ -398,15 +399,122 @@ def wait_for_disk_capacity(
         time.sleep(poll_seconds)
 
 
+def find_existing_staging_target(
+    dest_root: Path,
+    destination: Path,
+    staging_dirs: list[Path],
+) -> tuple[Path | None, bool]:
+    """
+    Verifica se a mídia ou suas partes já existem em algum dos diretórios de stage configurados.
+    Retorna (target_stage_file, has_existing_data).
+    """
+    try:
+        rel_dest = destination.resolve().relative_to(dest_root.resolve())
+    except Exception:
+        rel_dest = Path(destination.name)
+
+    stem = destination.stem
+
+    for stage_dir in staging_dirs:
+        target_cand = stage_dir / rel_dest
+        parent_cand = target_cand.parent
+        if not parent_cand.exists():
+            continue
+
+        # 1. Se o arquivo final já existe
+        if target_cand.exists() and target_cand.stat().st_size > 0:
+            return target_cand, True
+
+        # 2. Se o arquivo temporário concatenado ou partes parciais existem
+        tmp_base = parent_cand / f".{stem}.download"
+        if tmp_base.exists() and tmp_base.stat().st_size > 0:
+            return target_cand, True
+
+        # 3. Se existem arquivos .part ou .tmp dessa mídia
+        try:
+            if any(parent_cand.glob(f".{stem}.download*")):
+                return target_cand, True
+            if any(parent_cand.glob(f".{stem}.*.download*")):
+                return target_cand, True
+        except Exception:
+            pass
+
+    return None, False
+
+
+def has_partial_download_on_disk(file_stem: str, staging_dirs: list[Path]) -> bool:
+    """Verifica se existem partes ou arquivos de download parcial no disco de stage para esta mídia."""
+    clean_stem = file_stem.lower().strip()
+    for stage_dir in staging_dirs:
+        if not stage_dir.exists():
+            continue
+        try:
+            for root, _, files in os.walk(stage_dir):
+                for name in files:
+                    nl = name.lower()
+                    if clean_stem in nl and (".download" in nl or ".part" in nl):
+                        return True
+        except Exception:
+            continue
+    return False
+
+
+def get_series_key(file_path: Path) -> str:
+    """Retorna uma chave única normalizada para a série/pasta da mídia."""
+    parent_name = file_path.parent.name
+    if re.match(r"(?i)^season\s*\d+$", parent_name) and file_path.parent.parent != file_path.parent:
+        return file_path.parent.parent.name.lower()
+    ep_info = episode_identity(parent_name, file_path.name)
+    if ep_info:
+        return ep_info[0]
+    return parent_name.lower()
+
+
+def get_series_display_name(file_path: Path) -> str:
+    """Retorna o nome legível da série para exibição amigável no log."""
+    parent_name = file_path.parent.name
+    if re.match(r"(?i)^season\s*\d+$", parent_name) and file_path.parent.parent != file_path.parent:
+        return file_path.parent.parent.name
+    ep_info = episode_identity(parent_name, file_path.name)
+    if ep_info:
+        return ep_info[0].title()
+    return parent_name
+
+
+def format_download_error(exc: Exception) -> str:
+    """Extrai informações diagnósticas detalhadas de erros de download / HTTP."""
+    if isinstance(exc, urllib.error.HTTPError):
+        code = exc.code
+        headers = getattr(exc, "headers", None) or {}
+        asn_allowed = headers.get("X-Debug-ASNAllowed")
+        asn_org = headers.get("X-Debug-ASNOrg") or headers.get("X-Debug-ASN")
+        if code == 406:
+            if asn_allowed == "0" or asn_org:
+                return (
+                    f"HTTP Error 406: Bloqueio de Operadora/ASN pelo servidor IPTV "
+                    f"({asn_org or 'TELEFONICA/VIVO'}). Requer VPN/Proxy na máquina."
+                )
+            return "HTTP Error 406: Not Acceptable (servidor IPTV rejeitou formato/origem da requisição)"
+        if code == 403:
+            return "HTTP Error 403: Forbidden (acesso negado pelo servidor IPTV)"
+        if code == 401:
+            return "HTTP Error 401: Unauthorized (link ou credenciais da conta IPTV expirados)"
+        if code == 404:
+            return "HTTP Error 404: Not Found (arquivo de vídeo não existe no servidor remoto)"
+        reason = getattr(exc, "reason", "")
+        return f"HTTP Error {code}: {reason}".strip()
+    return str(exc)
+
+
 # =====================================================================
-# RASTREAMENTO E QUARENTENA DE FALHAS (.STRM QUEBRADOS / 401 / 404)
+# RASTREAMENTO E QUARENTENA DE FALHAS (.STRM QUEBRADOS / 401 / 404 / 406)
 # =====================================================================
 
 class FailureTracker:
     """
-    Rastreia falhas de download (.strm com links expirados, 401, 404 ou erros)
+    Rastreia falhas de download (.strm com links expirados, 401, 404, 406 ou erros)
     para evitar que o programa fique em loop infinito tentando baixar a mesma
-    mídia corrompida sempre que for iniciado.
+    mídia corrompida ou bloqueada sempre que for iniciado.
     """
 
     def __init__(self, cache_file: Path | None = None, cooldown_seconds: int = 7200):
@@ -415,8 +523,25 @@ class FailureTracker:
         self.cache_file = cache_file
         self.cooldown_seconds = cooldown_seconds
         self.failures: dict[str, dict[str, Any]] = {}
+        self.series_streak: dict[str, int] = {}
+        self.broken_series: set[str] = set()
         self._lock = threading.Lock()
         self._load()
+
+    def reset_cycle(self) -> None:
+        """Reseta o circuit breaker de séries para permitir reavaliação no início de cada ciclo."""
+        with self._lock:
+            self.series_streak.clear()
+            self.broken_series.clear()
+
+    def is_series_broken(self, file_path: Path) -> tuple[bool, str]:
+        """Verifica se a série desta mídia foi pausada no ciclo atual após falhas repetidas."""
+        series_k = get_series_key(file_path)
+        with self._lock:
+            if series_k in self.broken_series:
+                display_name = get_series_display_name(file_path)
+                return True, f"Série '{display_name}' pausada neste ciclo após falhas repetidas no servidor"
+            return False, ""
 
     def _load(self) -> None:
         if self.cache_file.exists():
@@ -434,7 +559,17 @@ class FailureTracker:
         except Exception as exc:
             logger.debug("Falha ao salvar tracker de falhas: %s", exc)
 
-    def should_skip(self, file_path: Path) -> tuple[bool, str]:
+    def should_skip(self, file_path: Path, staging_dirs: list[Path] | None = None) -> tuple[bool, str]:
+        # 1. Se a série inteira foi pausada pelo Circuit Breaker deste ciclo:
+        series_broken, s_reason = self.is_series_broken(file_path)
+        if series_broken:
+            # Mas se esse arquivo específico já tem parte baixada no stage, SEMPRE tenta terminar!
+            if staging_dirs and has_partial_download_on_disk(file_path.stem, staging_dirs):
+                pass
+            else:
+                return True, s_reason
+
+        # 2. Verificação individual do arquivo no cache persistido
         key = str(file_path.resolve())
         with self._lock:
             info = self.failures.get(key)
@@ -445,11 +580,24 @@ class FailureTracker:
             last_error = info.get("error", "Erro desconhecido")
             now = time.time()
 
-            # Se o erro for permanente (401, 403, 404, 410) ou se falhou mais de 2 vezes
-            is_fatal = any(code in last_error for code in ("401", "403", "404", "410"))
-            effective_cooldown = self.cooldown_seconds if not is_fatal else self.cooldown_seconds * 2
+            # Se existirem partes parciais baixadas no stage, SEMPRE retoma na nova sessão!
+            if staging_dirs and has_partial_download_on_disk(file_path.stem, staging_dirs):
+                return False, ""
 
-            if (now - last_time) < effective_cooldown:
+            # Se o erro for permanente (401, 403, 404, 406, 410)
+            is_fatal = any(code in last_error for code in ("401", "403", "404", "406", "410"))
+            if is_fatal:
+                effective_cooldown = self.cooldown_seconds * 2
+                if (now - last_time) < effective_cooldown:
+                    return True, f"{last_error} (Tentativas: {count}, Cooldown ativo)"
+                return False, ""
+
+            # Para erros transitórios (interrupções inesperadas, quedas de conexão):
+            # Não pula se teve menos de 3 tentativas, permitindo retomar de onde parou em outra sessão!
+            if count < 3:
+                return False, ""
+
+            if (now - last_time) < self.cooldown_seconds:
                 return True, f"{last_error} (Tentativas: {count}, Cooldown ativo)"
             return False, ""
 
@@ -463,17 +611,38 @@ class FailureTracker:
             self.failures[key] = info
             self._save()
 
+            # Circuit breaker por série para erros fatais de servidor remoto
+            is_fatal = any(code in str(error) for code in ("401", "403", "404", "406", "410"))
+            if is_fatal:
+                series_k = get_series_key(file_path)
+                streak = self.series_streak.get(series_k, 0) + 1
+                self.series_streak[series_k] = streak
+                if streak >= 3 and series_k not in self.broken_series:
+                    self.broken_series.add(series_k)
+                    display_name = get_series_display_name(file_path)
+                    logger.warning(
+                        "Série/pasta '%s' pausada neste ciclo após 3 falhas consecutivas no servidor (%s). "
+                        "Pulando demais episódios desta série para continuar o download das outras mídias.",
+                        display_name,
+                        str(error)[:120],
+                    )
+
     def record_success(self, file_path: Path) -> None:
         key = str(file_path.resolve())
+        series_k = get_series_key(file_path)
         with self._lock:
             if key in self.failures:
                 del self.failures[key]
                 self._save()
+            self.series_streak.pop(series_k, None)
 
     def clear(self) -> None:
         with self._lock:
             self.failures.clear()
+            self.series_streak.clear()
+            self.broken_series.clear()
             self._save()
+
 
 
 # =====================================================================
@@ -658,11 +827,8 @@ def download_strm_multipart(
     """
     target_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = target_path.parent / f".{target_path.stem}.download"
+    meta_path = Path(f"{tmp_path}.meta")
     part_paths: list[Path] = []
-
-    # Checar se já existe no destino
-    if target_path.exists() and target_path.stat().st_size > 0:
-        return target_path
 
     socket.setdefaulttimeout(read_timeout)
 
@@ -673,6 +839,9 @@ def download_strm_multipart(
             match = re.match(r"bytes\s+0-0/(\d+)", content_range)
 
             if not match:
+                # Checar se já existe no destino
+                if target_path.exists() and target_path.stat().st_size > 0:
+                    return target_path
                 # Servidor não suporta Range: download sequencial direto
                 logger.info("Download direto sem suporte a Range: %s", target_path.name)
                 with tmp_path.open("wb") as out:
@@ -680,16 +849,53 @@ def download_strm_multipart(
                 total = tmp_path.stat().st_size
             else:
                 total = int(match.group(1))
+
+                # Checar se já existe no destino completo
+                if target_path.exists():
+                    if target_path.stat().st_size == total:
+                        return target_path
+                    logger.warning(
+                        "Arquivo de destino com tamanho divergente (%d != %d). Reiniciando: %s",
+                        target_path.stat().st_size, total, target_path.name,
+                    )
+                    target_path.unlink(missing_ok=True)
+
+                # Checar se o arquivo já foi completamente unido antes de uma parada inesperada
+                if tmp_path.exists() and tmp_path.stat().st_size == total:
+                    logger.info("Arquivo unido já existente completo (%d bytes): %s", total, target_path.name)
+                    tmp_path.replace(target_path)
+                    meta_path.unlink(missing_ok=True)
+                    for leftover in target_path.parent.glob(f".{target_path.stem}.*.download*"):
+                        with contextlib.suppress(Exception):
+                            leftover.unlink(missing_ok=True)
+                    return target_path
+
                 wait_for_disk_capacity(target_path, total, min_free_percent)
+
+                # Recupera parts_count original caso salvo em sessão anterior
+                if meta_path.exists():
+                    try:
+                        with meta_path.open("r", encoding="utf-8") as f:
+                            saved_meta = json.load(f)
+                        if saved_meta.get("total") == total and saved_meta.get("parts_count"):
+                            parts_count = int(saved_meta["parts_count"])
+                    except Exception:
+                        pass
 
                 parts_count = min(max(parts_count, 1), 32)
                 part_size = (total + parts_count - 1) // parts_count
                 part_paths = [Path(f"{tmp_path}.part{index}") for index in range(parts_count)]
 
+                try:
+                    with meta_path.open("w", encoding="utf-8") as f:
+                        json.dump({"total": total, "parts_count": parts_count, "part_size": part_size}, f)
+                except Exception:
+                    pass
+
                 progress_lock = threading.Lock()
                 progress = {"downloaded": 0, "next_percent": 1, "last_logged_bytes": 0, "start_time": time.time()}
 
-                # Verificar partes válidas existentes para Resume
+                # Verificar partes válidas existentes e temporários parciais para Resume
                 for index, p_path in enumerate(part_paths):
                     start = index * part_size
                     end = min(start + part_size, total) - 1
@@ -699,6 +905,16 @@ def download_strm_multipart(
                             progress["downloaded"] += expected
                         else:
                             p_path.unlink(missing_ok=True)
+                    else:
+                        p_tmp = Path(f"{p_path}.tmp")
+                        if p_tmp.exists():
+                            if p_tmp.stat().st_size == expected:
+                                p_tmp.replace(p_path)
+                                progress["downloaded"] += expected
+                            elif 0 < p_tmp.stat().st_size < expected:
+                                progress["downloaded"] += p_tmp.stat().st_size
+                            else:
+                                p_tmp.unlink(missing_ok=True)
 
                 if progress["downloaded"] > 0:
                     percent = int(progress["downloaded"] * 100 / total)
@@ -721,26 +937,37 @@ def download_strm_multipart(
                     if part_file.exists() and part_file.stat().st_size == expected:
                         return
 
-                    part_file.unlink(missing_ok=True)
                     part_tmp = Path(f"{part_file}.tmp")
-                    part_tmp.unlink(missing_ok=True)
-
                     last_error = None
                     for attempt in range(1, max_retries + 1):
                         attempt_downloaded = 0
                         try:
-                            part_tmp.unlink(missing_ok=True)
+                            existing = part_tmp.stat().st_size if part_tmp.exists() else 0
+                            if existing == expected:
+                                part_tmp.replace(part_file)
+                                return
+                            if existing > expected:
+                                part_tmp.unlink(missing_ok=True)
+                                existing = 0
+
+                            req_start = start + existing
                             req = Request(
                                 url,
-                                headers={"Range": f"bytes={start}-{end}", "User-Agent": "VLC/3.0.21 LibVLC/3.0.21"},
+                                headers={"Range": f"bytes={req_start}-{end}", "User-Agent": "VLC/3.0.21 LibVLC/3.0.21"},
                             )
                             with urlopen(req, timeout=read_timeout) as part_resp:
-                                if getattr(part_resp, "status", None) and part_resp.status not in (200, 206):
-                                    raise IOError(f"HTTP status {part_resp.status} na parte {index + 1}")
-                                if start > 0 and getattr(part_resp, "status", None) == 200:
-                                    raise IOError(f"Servidor ignorou Range na parte {index + 1}")
+                                status = getattr(part_resp, "status", None)
+                                if status and status not in (200, 206):
+                                    raise IOError(f"HTTP status {status} na parte {index + 1}")
+                                if req_start > 0 and status == 200:
+                                    with progress_lock:
+                                        progress["downloaded"] = max(0, progress["downloaded"] - existing)
+                                    existing = 0
+                                    mode = "wb"
+                                else:
+                                    mode = "ab" if existing > 0 else "wb"
 
-                                with part_tmp.open("wb") as out:
+                                with part_tmp.open(mode) as out:
                                     while chunk := part_resp.read(64 * 1024):
                                         out.write(chunk)
                                         attempt_downloaded += len(chunk)
@@ -775,7 +1002,8 @@ def download_strm_multipart(
                                 percent = min(100, int(progress["downloaded"] * 100 / total))
                                 progress["next_percent"] = percent + 1
                                 progress["last_logged_bytes"] = progress["downloaded"]
-                            part_tmp.unlink(missing_ok=True)
+                            if part_tmp.exists() and part_tmp.stat().st_size > expected:
+                                part_tmp.unlink(missing_ok=True)
                             part_file.unlink(missing_ok=True)
                             if attempt < max_retries:
                                 time.sleep(attempt * 2)
@@ -790,10 +1018,15 @@ def download_strm_multipart(
                     for part_path in part_paths:
                         with part_path.open("rb") as part:
                             shutil.copyfileobj(part, out, length=1024 * 1024)
-                        part_path.unlink(missing_ok=True)
 
                 if tmp_path.stat().st_size != total:
                     raise IOError(f"Arquivo final com tamanho incorreto ({tmp_path.stat().st_size} != {total})")
+
+                # Deleta partes e meta apenas APÓS o arquivo final estar 100% íntegro
+                for part_path in part_paths:
+                    part_path.unlink(missing_ok=True)
+                    Path(f"{part_path}.tmp").unlink(missing_ok=True)
+                meta_path.unlink(missing_ok=True)
 
         tmp_path.replace(target_path)
         # Limpar sobras de arquivos temporários
@@ -803,13 +1036,10 @@ def download_strm_multipart(
         return target_path
 
     except Exception:
-        # Limpar apenas os arquivos temporários (.tmp), PRESERVANDO as partes já baixadas (.part)
-        # para que a retomada (resume) funcione imediatamente ao reiniciar ou retentar!
+        # Limpar apenas arquivo final parcial (.download), PRESERVANDO as partes já baixadas (.part)
+        # e fragmentos (.tmp) válidos para que a retomada funcione na próxima sessão ou retentativa!
         with contextlib.suppress(Exception):
             tmp_path.unlink(missing_ok=True)
-        for part_path in part_paths:
-            with contextlib.suppress(Exception):
-                Path(f"{part_path}.tmp").unlink(missing_ok=True)
         raise
 
 
@@ -1214,12 +1444,21 @@ def process_strm_item(
                     failure_tracker.record_failure(strm_path, str(exc))
                 return False
 
-            best_stage = get_best_staging_root(staging_dirs, remote_size, min_free_percent)
-            try:
-                rel_dest = destination.relative_to(dest_root)
-                target_stage_file = best_stage / rel_dest
-            except Exception:
-                target_stage_file = best_stage / destination.name
+            existing_stage_target, has_existing = find_existing_staging_target(
+                dest_root=dest_root,
+                destination=destination,
+                staging_dirs=staging_dirs,
+            )
+            if existing_stage_target and has_existing:
+                target_stage_file = existing_stage_target
+                logger.info("Retomando download/mídia existente no Stage: %s", target_stage_file.parent)
+            else:
+                best_stage = get_best_staging_root(staging_dirs, remote_size, min_free_percent)
+                try:
+                    rel_dest = destination.relative_to(dest_root)
+                    target_stage_file = best_stage / rel_dest
+                except Exception:
+                    target_stage_file = best_stage / destination.name
             target_stage_file.parent.mkdir(parents=True, exist_ok=True)
 
             logger.info(
@@ -1244,9 +1483,10 @@ def process_strm_item(
                     min_free_percent=min_free_percent,
                 )
             except Exception as exc:
-                logger.error("Erro no download de %s: %s", strm_path.name, exc)
+                err_msg = format_download_error(exc)
+                logger.error("Erro no download de %s: %s", strm_path.name, err_msg)
                 if failure_tracker:
-                    failure_tracker.record_failure(strm_path, str(exc))
+                    failure_tracker.record_failure(strm_path, err_msg)
                 return False
 
             # 4. Registrar na fila do MongoDB do Nebula
@@ -1289,12 +1529,20 @@ def process_strm_item(
 
             # 2. Obter tamanho do arquivo local e alocar melhor pasta de stage
             file_size = strm_path.stat().st_size
-            best_stage = get_best_staging_root(staging_dirs, file_size, min_free_percent)
-            try:
-                rel_dest = destination.relative_to(dest_root)
-                target_stage_file = best_stage / rel_dest
-            except Exception:
-                target_stage_file = best_stage / destination.name
+            existing_stage_target, has_existing = find_existing_staging_target(
+                dest_root=dest_root,
+                destination=destination,
+                staging_dirs=staging_dirs,
+            )
+            if existing_stage_target and has_existing:
+                target_stage_file = existing_stage_target
+            else:
+                best_stage = get_best_staging_root(staging_dirs, file_size, min_free_percent)
+                try:
+                    rel_dest = destination.relative_to(dest_root)
+                    target_stage_file = best_stage / rel_dest
+                except Exception:
+                    target_stage_file = best_stage / destination.name
             target_stage_file.parent.mkdir(parents=True, exist_ok=True)
 
             logger.info(
@@ -1384,8 +1632,16 @@ def run_downloader(args: argparse.Namespace) -> int:
 
     while True:
         try:
+            if failure_tracker:
+                failure_tracker.reset_cycle()
             logger.info("Escaneando e priorizando arquivos .strm...")
             items = iter_strm_files_prioritized(sources, exclude_dirs)
+            # Prioriza mídias que já tenham partes baixadas em stage para que continuem e terminem imediatamente
+            def item_has_partial(it):
+                _, m_path, _, _ = it
+                return not has_partial_download_on_disk(m_path.stem, staging_dirs)
+
+            items.sort(key=item_has_partial)
             logger.info("Total de arquivos .strm encontrados: %d", len(items))
 
             processed_any = False
@@ -1393,7 +1649,7 @@ def run_downloader(args: argparse.Namespace) -> int:
                 stats.scanned += 1
 
                 # Checagem contra loop de mídias que falharam recentemente (401/404/erros)
-                should_skip, skip_reason = failure_tracker.should_skip(strm_path)
+                should_skip, skip_reason = failure_tracker.should_skip(strm_path, staging_dirs)
                 if should_skip:
                     logger.debug("Pulando mídia com falha recente: %s (%s)", strm_path.name, skip_reason)
                     continue

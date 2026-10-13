@@ -1385,7 +1385,24 @@ class NebulaGUI:
             self.dl_pct_lbl.config(text="50.0% (Transferindo para Stage...)")
             return
 
-        # 2. Detecta progresso do download
+        # 2. Detecta retomada de download (Resume)
+        m_resume = re.search(
+            r"Resumindo\s+(.+?):\s*([\d.]+)\s*MB\s*/\s*([\d.]+)\s*MB\s*\((\d+)%\)\s*j[aá]\s*no\s*disco",
+            line,
+            re.IGNORECASE,
+        )
+        if m_resume:
+            name = m_resume.group(1).strip()
+            done_mb = float(m_resume.group(2))
+            total_mb = float(m_resume.group(3))
+            pct = float(m_resume.group(4))
+            self.dl_name_lbl.config(text=f"Resumindo: {name}")
+            self.dl_meta_lbl.config(text=f"Retomando download ({done_mb:.1f} MB já no disco)")
+            self.dl_pbar["value"] = pct
+            self.dl_pct_lbl.config(text=f"{pct:.1f}% ({done_mb:.1f} MB / {total_mb:.1f} MB já no disco)")
+            return
+
+        # 3. Detecta progresso do download
         m_prog = re.search(
             r"Baixando\s+(.+?):\s*([\d.]+)\s*MB\s*/\s*([\d.]+)\s*MB\s*\((\d+)%\)(?:\s*-\s*Vel:\s*([\d.]+\s*MB/s))?",
             line,
@@ -1457,17 +1474,7 @@ class NebulaGUI:
                     active_docs = list(client.ftp.files.find({"status": {"$in": ["uploading", "queued", "staging"]}}, {"name": 1, "status": 1, "size": 1, "uploaded_bytes": 1, "parts": 1, "worker_id": 1, "bot_index": 1, "mtime": 1, "ctime": 1}))
                     client.close()
 
-                    def has_upload_progress(doc):
-                        try:
-                            return int(doc.get("uploaded_bytes") or 0) > 0
-                        except (TypeError, ValueError):
-                            return False
-
-                    active_count = sum(
-                        1
-                        for doc in active_docs
-                        if doc.get("status") == "uploading" or has_upload_progress(doc)
-                    )
+                    active_count = sum(doc.get("status") == "uploading" for doc in active_docs)
                     queued_count = len(active_docs) - active_count
                     self.progress_frame.config(
                         text=(
@@ -1476,13 +1483,12 @@ class NebulaGUI:
                         )
                     )
 
-                    # A fila é representada somente pelo contador. Os cards
-                    # devem mostrar exclusivamente arquivos que já começaram
-                    # a transmitir.
+                    # Resumed byte progress is persistent, so it does not mean
+                    # the file is currently transmitting. MongoDB status does.
                     upload_docs = [
                         doc
                         for doc in active_docs
-                        if doc.get("status") == "uploading" or has_upload_progress(doc)
+                        if doc.get("status") == "uploading"
                     ]
                     current_names = {doc["name"] for doc in upload_docs}
 
@@ -1497,32 +1503,33 @@ class NebulaGUI:
                         name = doc.get("name", "Arquivo")
                         status = doc.get("status", "uploading")
                         total = doc.get("size", 1) or 1
-                        worker_id = doc.get("worker_id", "?")
+                        worker_id = doc.get("worker_id")
                         
                         uploaded = doc.get("uploaded_bytes", 0)
                         parts = doc.get("parts", [])
                         bot_indexes = sorted({
-                            part.get("bot_index")
+                            part.get("bot_index") + 1
                             for part in parts
                             if isinstance(part.get("bot_index"), int)
                         })
                         if bot_indexes:
                             shown_bots = ", ".join(f"#{idx}" for idx in bot_indexes[:4])
                             remaining_bots = len(bot_indexes) - 4
-                            bot_text = f"Bots {shown_bots}" + (f" +{remaining_bots}" if remaining_bots else "")
+                            bot_text = f"Bots usados {shown_bots}" + (f" +{remaining_bots}" if remaining_bots else "")
                         else:
                             bot_text = "Bots rotativos"
                         if uploaded > 0 and total > 0:
                             pct = (uploaded / total) * 100
                         elif parts:
                             done_parts = len(parts)
-                            total_parts = max(1, (total + (64 * 1024 * 1024) - 1) // (64 * 1024 * 1024))
+                            total_parts = max(1, (total + (16 * 1024 * 1024) - 1) // (16 * 1024 * 1024))
                             pct = (done_parts / total_parts) * 100
                         else:
                             pct = 0.0
 
                         display_name = doc.get("display_name", name)
-                        info_text = f"Uploading | Worker #{worker_id} | {bot_text} | {display_name[:50]}"
+                        worker_text = f"Worker #{worker_id}" if worker_id is not None else "Worker ativo"
+                        info_text = f"Uploading | {worker_text} | {bot_text} | {display_name[:50]}"
 
                         if name not in self.file_bars:
                             item_frame = tk.Frame(self.scroll_content, bg="#313244", pady=6, padx=10)

@@ -493,32 +493,45 @@ def materialize_strm(src: Path, overwrite: bool = False, target: Path | None = N
                         print(f"[STRM] Parte {index + 1}/{parts_count} reutilizada (ja baixada)", flush=True)
                         return
 
-                    part_file.unlink(missing_ok=True)
                     part_tmp = Path(f"{part_file}.tmp")
-                    part_tmp.unlink(missing_ok=True)
-
                     retries = max(1, int(os.getenv("STRM_PART_RETRIES", "4")))
                     last_error = None
                     for attempt in range(1, retries + 1):
                         attempt_downloaded = 0
                         try:
-                            part_tmp.unlink(missing_ok=True)
+                            existing = part_tmp.stat().st_size if part_tmp.exists() else 0
+                            if existing == expected:
+                                part_tmp.replace(part_file)
+                                print(f"[STRM] Parte {index + 1}/{parts_count} concluida", flush=True)
+                                return
+                            if existing > expected:
+                                part_tmp.unlink(missing_ok=True)
+                                existing = 0
+
                             print(
                                 f"[STRM] Parte {index + 1}/{parts_count} iniciando download "
-                                f"({expected / 1024 / 1024:.1f} MB, tentativa {attempt}/{retries})...",
+                                f"({(expected - existing) / 1024 / 1024:.1f} MB restantes de {expected / 1024 / 1024:.1f} MB, tentativa {attempt}/{retries})...",
                                 flush=True,
                             )
-                            request = Request(url, headers={"Range": f"bytes={start}-{end}", "User-Agent": "Mozilla/5.0"})
+                            req_start = start + existing
+                            request = Request(url, headers={"Range": f"bytes={req_start}-{end}", "User-Agent": "Mozilla/5.0"})
                             with urlopen(request, timeout=read_timeout) as part_response:
-                                if getattr(part_response, "status", None) and part_response.status not in (200, 206):
-                                    raise IOError(f"HTTP status {part_response.status} ao baixar parte {index + 1}")
-                                if start > 0 and getattr(part_response, "status", None) == 200:
-                                    raise IOError(f"Servidor ignorou cabecalho Range e retornou HTTP 200 para parte {index + 1}")
+                                status = getattr(part_response, "status", None)
+                                if status and status not in (200, 206):
+                                    raise IOError(f"HTTP status {status} ao baixar parte {index + 1}")
+                                if req_start > 0 and status == 200:
+                                    with progress_lock:
+                                        progress["downloaded"] = max(0, progress["downloaded"] - existing)
+                                    existing = 0
+                                    mode = "wb"
+                                else:
+                                    mode = "ab" if existing > 0 else "wb"
+
                                 sock = getattr(getattr(getattr(part_response, "fp", None), "raw", None), "_sock", None)
                                 if sock is not None:
                                     with contextlib.suppress(Exception):
                                         sock.settimeout(read_timeout)
-                                with part_tmp.open("wb") as out:
+                                with part_tmp.open(mode) as out:
                                     while chunk := part_response.read(64 * 1024):
                                         out.write(chunk)
                                         attempt_downloaded += len(chunk)
@@ -547,7 +560,8 @@ def materialize_strm(src: Path, overwrite: bool = False, target: Path | None = N
                                 percent = min(100, int(progress["downloaded"] * 100 / total))
                                 progress["next_percent"] = percent + 1
                                 progress["last_logged_bytes"] = progress["downloaded"]
-                            part_tmp.unlink(missing_ok=True)
+                            if part_tmp.exists() and part_tmp.stat().st_size > expected:
+                                part_tmp.unlink(missing_ok=True)
                             part_file.unlink(missing_ok=True)
                             print(
                                 f"[STRM] Parte {index + 1}/{parts_count} falhou "
@@ -565,9 +579,11 @@ def materialize_strm(src: Path, overwrite: bool = False, target: Path | None = N
                     for part_path in part_paths:
                         with part_path.open("rb") as part:
                             shutil.copyfileobj(part, out, length=1024 * 1024)
-                        part_path.unlink(missing_ok=True)
                 if tmp_path.stat().st_size != total:
                     raise IOError("Arquivo materializado com tamanho incorreto")
+                for part_path in part_paths:
+                    part_path.unlink(missing_ok=True)
+                    Path(f"{part_path}.tmp").unlink(missing_ok=True)
         tmp_path.replace(target)
         for leftover in target.parent.glob(f".{src.stem}.*.download*"):
             with contextlib.suppress(Exception):
@@ -579,14 +595,7 @@ def materialize_strm(src: Path, overwrite: bool = False, target: Path | None = N
     except Exception:
         with contextlib.suppress(FileNotFoundError):
             tmp_path.unlink(missing_ok=True)
-        for part_path in part_paths:
-            with contextlib.suppress(FileNotFoundError):
-                Path(f"{part_path}.tmp").unlink(missing_ok=True)
-            with contextlib.suppress(FileNotFoundError):
-                part_path.unlink(missing_ok=True)
-        for leftover in target.parent.glob(f"{tmp_path.name}*.tmp"):
-            with contextlib.suppress(FileNotFoundError):
-                leftover.unlink(missing_ok=True)
+        # Preserva arquivos .part completados para retomada em outra sessão!
         raise
 
 
@@ -1519,7 +1528,7 @@ def main() -> int:
     while True:
         # Periodic cleanup
         if time.monotonic() - last_cleanup >= 600:
-            stale_seconds = max(300, int(os.getenv("INCOMPLETE_MAX_AGE_SECONDS", "1800")))
+            stale_seconds = max(300, int(os.getenv("INCOMPLETE_MAX_AGE_SECONDS", "86400")))
             removed, released = cleanup_stale_downloads(cleanup_roots, stale_seconds)
             last_cleanup = time.monotonic()
             if removed:

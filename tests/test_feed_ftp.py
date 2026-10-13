@@ -679,5 +679,36 @@ def test_get_best_staging_root_falls_back_when_fastest_disk_full(tmp_path, monke
     assert best_root == disk_f.resolve()
 
 
+def test_materialize_strm_preserves_completed_parts_on_failure(tmp_path, monkeypatch):
+    import pytest
+
+    src = tmp_path / "movie.strm"
+    src.write_text("https://example.com/movie.mp4\n", encoding="utf-8")
+    media = bytes(range(100))  # 4 partes de 25 bytes
+    target = tmp_path / "movie.mp4"
+    tmp_base = tmp_path / ".movie.download"
+    part0 = Path(f"{tmp_base}.part0")
+    part0.write_bytes(media[0:25])
+
+    def fake_urlopen_failing(request, timeout=0):
+        val = request.get_header("Range")
+        if val == "bytes=0-0":
+            resp = _FakeResponse(media[:1])
+            resp.headers["Content-Range"] = f"bytes 0-0/{len(media)}"
+            return resp
+        raise IOError("Simulated connection failure during download")
+
+    monkeypatch.setenv("STRM_DOWNLOAD_PARTS", "4")
+    monkeypatch.setattr(feed_ftp, "urlopen", fake_urlopen_failing)
+
+    with pytest.raises(IOError):
+        feed_ftp.materialize_strm(src, target=target)
+
+    # A parte 0 já concluída antes da falha NÃO pode ter sido deletada!
+    assert part0.exists()
+    assert part0.read_bytes() == media[0:25]
+
+
+
 
 

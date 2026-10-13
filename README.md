@@ -155,6 +155,11 @@ python main.py
    - Permissões (leitura/escrita)
    - Limitar acesso por pasta
 
+5. **[📑 Biblioteca STRM](docs/STRM_LIBRARY.md)**
+   - Criação automática de link após upload completo de mídia executável
+   - Geração incremental a partir dos arquivos concluídos no MongoDB
+   - Reconciliação pelo ID, preservação de conflitos e reparo de nomes genéricos
+
 ---
 
 ### 🏗️ Ecossistema Nebula
@@ -194,8 +199,13 @@ HOST=0.0.0.0
 PORT=2121
 Performance
 
-MAX_WORKERS=10 # Máximo de arquivos enviados simultaneamente
-CHUNK_SIZE_MB=64 # Tamanho dos chunks
+MAX_WORKERS=28 # Máximo de arquivos enviados simultaneamente
+UPLOAD_CONCURRENCY=24 # Requisições simultâneas; 28 bots continuam na rotação
+UPLOAD_CONCURRENCY_MIN=4
+UPLOAD_CONCURRENCY_MAX=24 # Limite inicial conservador após erros de transporte em rajada
+UPLOAD_CONCURRENCY_START=20 # Sobe gradualmente após sucessos; recua em falhas/limites
+PART_WORKERS_PER_FILE=1 # Arquivos e requisições são limites distintos
+CHUNK_SIZE_MB=16 # Tamanho dos chunks
 MAX_RETRIES=5 # Tentativas de retry
 Logging
 

@@ -29,6 +29,14 @@ class FakeRPCError(Exception):
     pass
 
 
+class FakeTelegramBotAPIError(ConnectionError):
+    def __init__(self, message, *, status, error_code, retry_after=0):
+        super().__init__(message)
+        self.status = status
+        self.code = error_code
+        self.retry_after = retry_after
+
+
 def _make_bot(name: str = "bot") -> AsyncMock:
     bot = AsyncMock()
     bot.name = name
@@ -76,6 +84,7 @@ sys.modules["bson.objectid"] = MagicMock()
 
 # Stub ftp package so main.py can `from ftp import ...`
 _fake_ftp = MagicMock()
+_fake_ftp.TelegramBotAPIError = FakeTelegramBotAPIError
 sys.modules["ftp"] = _fake_ftp
 sys.modules["ftp.common"] = _fake_ftp
 sys.modules["ftp.server"] = _fake_ftp
@@ -94,6 +103,7 @@ spec.loader.exec_module(main_mod)
 # Rebind the patched errors into the loaded module so isinstance works
 main_mod.FloodWait = FakeFloodWait
 main_mod.RPCError = FakeRPCError
+main_mod.TelegramBotAPIError = FakeTelegramBotAPIError
 
 upload_part_with_retries = main_mod.upload_part_with_retries
 _readahead_producer = main_mod._readahead_producer
@@ -125,6 +135,27 @@ def test_classify_media_type_uses_exact_library_category():
     ) == "SERIE"
 
 
+def test_log_upload_strm_result_records_created_target(monkeypatch, caplog, tmp_path):
+    caplog.set_level("INFO")
+    target = tmp_path / "Films" / "Movie.strm"
+    monkeypatch.setattr(main_mod, "create_upload_strm", lambda _doc: ("generated", target))
+
+    main_mod.log_upload_strm_result("Movie.mkv", {"_id": "media-id"})
+
+    assert "[STRM] Criado: Movie.mkv" in caplog.text
+
+
+def test_log_upload_strm_result_swallows_sidecar_error(monkeypatch, caplog):
+    def fail(_doc):
+        raise OSError("read-only library")
+
+    monkeypatch.setattr(main_mod, "create_upload_strm", fail)
+
+    main_mod.log_upload_strm_result("Movie.mkv", {"_id": "media-id"})
+
+    assert "Falha ao criar link da mídia concluída: Movie.mkv" in caplog.text
+
+
 # ===========================================================================
 # 1. Bot rotation tests
 # ===========================================================================
@@ -132,6 +163,9 @@ def test_classify_media_type_uses_exact_library_category():
 @pytest.mark.asyncio
 async def test_global_upload_concurrency_limit(monkeypatch):
     monkeypatch.setattr(main_mod, "UPLOAD_CONCURRENCY", 2)
+    monkeypatch.setattr(main_mod, "UPLOAD_CONCURRENCY_START", 2)
+    monkeypatch.setattr(main_mod, "UPLOAD_CONCURRENCY_MIN", 1)
+    monkeypatch.setattr(main_mod, "UPLOAD_CONCURRENCY_MAX", 2)
     main_mod._UPLOAD_SEMAPHORE = None
     main_mod._UPLOAD_SEMAPHORE_LOOP = None
     active = 0
@@ -149,20 +183,88 @@ async def test_global_upload_concurrency_limit(monkeypatch):
     assert peak == 2
 
 
-def test_worker_count_uses_file_limit_not_transmission_slots(monkeypatch):
-    monkeypatch.setattr(main_mod, "MAX_WORKERS", 10)
-    monkeypatch.setattr(main_mod, "UPLOAD_CONCURRENCY", 80)
-    monkeypatch.setattr(main_mod, "PART_WORKERS_PER_FILE", 4)
+def test_worker_count_is_file_limit_not_part_request_limit(monkeypatch):
+    monkeypatch.setattr(main_mod, "MAX_WORKERS", 28)
+    monkeypatch.setattr(main_mod, "UPLOAD_CONCURRENCY_MAX", 28)
 
-    assert main_mod.get_upload_worker_count(23) == 5
+    assert main_mod.get_upload_worker_count(28) == 28
 
 
 def test_worker_count_allows_ten_files_with_a_single_bot(monkeypatch):
     monkeypatch.setattr(main_mod, "MAX_WORKERS", 10)
-    monkeypatch.setattr(main_mod, "UPLOAD_CONCURRENCY", 80)
+    monkeypatch.setattr(main_mod, "UPLOAD_CONCURRENCY_MAX", 28)
     monkeypatch.setattr(main_mod, "PART_WORKERS_PER_FILE", 3)
 
     assert main_mod.get_upload_worker_count(1) == 1
+
+
+@pytest.mark.asyncio
+async def test_adaptive_limiter_reduces_on_rate_limit_and_recovers():
+    limiter = main_mod.AdaptiveUploadLimiter(initial=8, minimum=2, maximum=28)
+    await limiter.penalize("FloodWait")
+    assert limiter.snapshot()["request_limit"] == 4
+    for _ in range(4):
+        await limiter.success()
+    assert limiter.snapshot()["request_limit"] == 5
+
+
+@pytest.mark.asyncio
+async def test_single_connection_establishment_error_decreases_one_slot():
+    limiter = main_mod.AdaptiveUploadLimiter(initial=13, minimum=4, maximum=28)
+
+    await limiter.penalize("connection-establishment")
+
+    assert limiter.snapshot()["request_limit"] == 12
+
+
+@pytest.mark.asyncio
+async def test_single_bot_transport_error_does_not_halve_global_concurrency():
+    limiter = main_mod.AdaptiveUploadLimiter(initial=28, minimum=4, maximum=28)
+
+    await limiter.penalize("bot-transport")
+
+    assert limiter.snapshot()["request_limit"] == 27
+
+
+@pytest.mark.asyncio
+async def test_clustered_bot_transport_errors_apply_only_one_moderate_backoff_per_window(monkeypatch):
+    limiter = main_mod.AdaptiveUploadLimiter(initial=28, minimum=4, maximum=28)
+    now = [100.0]
+    monkeypatch.setattr(main_mod.time, "monotonic", lambda: now[0])
+
+    for _ in range(10):
+        await limiter.penalize("bot-transport")
+
+    assert limiter.snapshot()["request_limit"] == 20
+
+    now[0] += 16
+    await limiter.penalize("bot-transport")
+
+    assert limiter.snapshot()["request_limit"] == 19
+
+
+def test_non_periodic_queue_events_do_not_reset_throughput_sample(monkeypatch):
+    metrics = main_mod.Metrics
+    monkeypatch.setattr(metrics, "bytes_uploaded", 10 * 1024 * 1024)
+    monkeypatch.setattr(metrics, "_last_bytes", 0)
+    monkeypatch.setattr(metrics, "_last_sample_at", 10.0)
+    monkeypatch.setattr(metrics, "_last_mbps", 0.0)
+    monkeypatch.setattr(main_mod.time, "monotonic", lambda: 20.0)
+
+    event_rate = metrics.snapshot(sample=False)
+
+    assert event_rate["mb_s"] == 0.0
+    assert metrics._last_bytes == 0
+    periodic_rate = metrics.snapshot(sample=True)
+    assert periodic_rate["mb_s"] == 1.0
+    assert metrics._last_bytes == 10 * 1024 * 1024
+
+
+def test_available_bot_selection_skips_cooldown(monkeypatch):
+    bots = [object(), object(), object()]
+    main_mod.UPLOAD_BOT_CURSOR = 0
+    main_mod.BOT_COOLDOWNS = {id(bots[0]): main_mod.time.monotonic() + 60}
+    assert main_mod.next_available_upload_bot_index(bots) == 1
 
 
 def test_media_bot_selection_rotates_across_full_pool(monkeypatch):
@@ -187,6 +289,20 @@ def test_staging_path_detection(monkeypatch, tmp_path):
 
     assert main_mod.is_staging_path(staging / "movie.mkv") is True
     assert main_mod.is_staging_path(tmp_path / "source" / "movie.mkv") is False
+
+
+def test_stage_scan_collects_only_nonempty_regular_uploadable_files(monkeypatch, tmp_path):
+    monkeypatch.setattr(main_mod, "is_uploadable_name", lambda name: name.lower().endswith(".mkv"))
+    (tmp_path / "movie.mkv").write_bytes(b"video")
+    (tmp_path / "empty.mkv").write_bytes(b"")
+    (tmp_path / ".hidden.mkv").write_bytes(b"hidden")
+    (tmp_path / "movie.mkv.partial").write_bytes(b"partial")
+    (tmp_path / "folder.mkv").mkdir()
+
+    files = main_mod._collect_stage_uploadable_files(tmp_path)
+
+    assert [row[0].name for row in files] == ["movie.mkv"]
+    assert files[0][1] == 5
 
 
 def test_source_cleanup_ignores_legacy_global_delete(monkeypatch, tmp_path):
@@ -252,6 +368,32 @@ async def test_upload_marks_bot_busy_and_releases_it(tmp_path):
     bot.send_document.side_effect = send_document
     await upload_part_with_retries(1, [bot], "chat", str(fpath), "uuid", 0)
     assert bot._nebula_uploads == 0
+
+
+@pytest.mark.asyncio
+async def test_send_start_callback_waits_until_global_slot_is_acquired(monkeypatch):
+    monkeypatch.setattr(main_mod, "UPLOAD_CONCURRENCY_START", 1)
+    monkeypatch.setattr(main_mod, "UPLOAD_CONCURRENCY_MIN", 1)
+    monkeypatch.setattr(main_mod, "UPLOAD_CONCURRENCY_MAX", 1)
+    main_mod._UPLOAD_SEMAPHORE = None
+    main_mod._UPLOAD_SEMAPHORE_LOOP = None
+    limiter = main_mod.get_upload_semaphore()
+    await limiter.acquire()
+
+    bot = _make_bot("bot0")
+    bot.send_document.return_value = _make_sent_msg("f0", 1)
+    send_started = []
+    task = asyncio.create_task(
+        main_mod._send_part_on_idle_bot(
+            bot, "chat", b"data", "part.bin", on_send_start=lambda: send_started.append(True)
+        )
+    )
+    await asyncio.sleep(0)
+    assert send_started == []
+
+    await limiter.release()
+    await task
+    assert send_started == [True]
 
 
 @pytest.mark.asyncio
@@ -386,6 +528,70 @@ class TestBotRotation:
         assert result["bot_index"] == 1
         bot0.send_document.assert_awaited_once()
         bot1.send_document.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_single_bot_api_transport_failure_only_decreases_one_slot(self, tmp_path, monkeypatch):
+        main_mod.CHUNK_SIZE = 1024
+        fpath = tmp_path / "file.bin"
+        fpath.write_bytes(b"x" * 1024)
+        bot0, bot1 = _make_bot("bot0"), _make_bot("bot1")
+        limiter = main_mod.AdaptiveUploadLimiter(initial=20, minimum=4, maximum=28)
+        monkeypatch.setattr(main_mod, "get_upload_semaphore", lambda: limiter)
+        monkeypatch.setattr(main_mod, "BOT_COOLDOWNS", {})
+        monkeypatch.setattr(main_mod, "UPLOAD_BOT_CURSOR", 0)
+
+        async def send(bot, *_args, **_kwargs):
+            if bot is bot0:
+                raise ConnectionError("Telegram Bot API transport failed: ClientOSError")
+            return _make_sent_msg("f1", 2)
+
+        monkeypatch.setattr(main_mod, "_send_part_document", send)
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await upload_part_with_retries(
+                worker_id=1,
+                bots=[bot0, bot1],
+                target_chat_id="chat1",
+                local_path=str(fpath),
+                file_uuid="uuid-test",
+                part_num=0,
+            )
+
+        assert result["bot_index"] == 1
+        assert limiter.snapshot()["request_limit"] == 19
+        assert id(bot0) in main_mod.BOT_COOLDOWNS
+
+    @pytest.mark.asyncio
+    async def test_bot_api_429_honors_retry_after_and_rotates(self, tmp_path, monkeypatch):
+        main_mod.CHUNK_SIZE = 1024
+        fpath = tmp_path / "file.bin"
+        fpath.write_bytes(b"x" * 1024)
+        bot0, bot1 = _make_bot("bot0"), _make_bot("bot1")
+        limiter = main_mod.AdaptiveUploadLimiter(initial=20, minimum=4, maximum=28)
+        monkeypatch.setattr(main_mod, "get_upload_semaphore", lambda: limiter)
+        monkeypatch.setattr(main_mod, "BOT_COOLDOWNS", {})
+        monkeypatch.setattr(main_mod, "UPLOAD_BOT_CURSOR", 0)
+
+        async def send(bot, *_args, **_kwargs):
+            if bot is bot0:
+                raise FakeTelegramBotAPIError(
+                    "rate limited", status=429, error_code=429, retry_after=17
+                )
+            return _make_sent_msg("f1", 2)
+
+        monkeypatch.setattr(main_mod, "_send_part_document", send)
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await upload_part_with_retries(
+                worker_id=1,
+                bots=[bot0, bot1],
+                target_chat_id="chat1",
+                local_path=str(fpath),
+                file_uuid="uuid-test",
+                part_num=0,
+            )
+
+        assert result["bot_index"] == 1
+        assert limiter.snapshot()["request_limit"] == 10
+        assert main_mod.BOT_COOLDOWNS[id(bot0)] - main_mod.time.monotonic() == pytest.approx(17, abs=0.1)
 
     @pytest.mark.asyncio
     async def test_floodwait_rotates_multiple_times(self, tmp_path):
@@ -1126,14 +1332,6 @@ async def test_cleanup_duplicate_target_records(tmp_path):
     assert deleted_ids == []
     assert updated_ids == ["l1", "l2"]
 
-
-def test_get_small_upload_worker_count(monkeypatch):
-    assert main_mod.get_small_upload_worker_count(28) == 12
-    assert main_mod.get_small_upload_worker_count(4) == 4
-    assert main_mod.get_small_upload_worker_count(1) == 1
-
-    monkeypatch.setenv("SMALL_WORKERS", "6")
-    assert main_mod.get_small_upload_worker_count(28) == 6
 
 
 

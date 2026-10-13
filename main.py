@@ -26,6 +26,7 @@ import re
 import shutil
 import signal
 import ssl
+import stat as stat_module
 import subprocess
 import sys
 import time
@@ -74,9 +75,14 @@ except Exception:
 from control_plane import ControlPlane, FeederSupervisor, validate_ftp_security
 from ftp import MongoDBPathIO, MongoDBUserManager, Server
 from ftp.common import UPLOAD_QUEUE
-from ftp.pathio import MongoDBMemoryIO, Node, is_uploadable_name, movie_folder_score
+from ftp.pathio import MongoDBMemoryIO, Node, is_uploadable_name, media_cache_maintenance, movie_folder_score
 from ftp.range import parse_range as _parse_range
-from ftp.tg import install_reliable_upload, send_document_bot_api
+from ftp.tg import (
+    TelegramBotAPIError,
+    close_upload_http_sessions,
+    install_reliable_upload,
+    send_document_bot_api,
+)
 
 for stream in (sys.stdout, sys.stderr):
     if hasattr(stream, "reconfigure"):
@@ -96,19 +102,27 @@ LOG_COMPACT_LINES = int(environ.get("LOG_COMPACT_LINES", "1000"))
 LOG_CONTEXT_FILE = environ.get("LOG_CONTEXT_FILE", "nebula_context.md")
 LOG_MAX_SIZE = max(1, int(environ.get("LOG_MAX_SIZE", "5")))
 LOG_BACKUP_COUNT = max(0, int(environ.get("LOG_BACKUP_COUNT", "3")))
-CHUNK_SIZE_MB = int(environ.get("CHUNK_SIZE_MB", "64"))
+CHUNK_SIZE_MB = int(environ.get("CHUNK_SIZE_MB", "16"))
 CHUNK_SIZE = CHUNK_SIZE_MB * 1024 * 1024
 MAX_RETRIES = int(environ.get("MAX_RETRIES", "5"))
 MAX_STAGING_AGE = int(environ.get("MAX_STAGING_AGE", "3600"))
-MAX_WORKERS = int(environ.get("MAX_WORKERS", "4"))
-PART_WORKERS_PER_FILE = max(1, int(environ.get("PART_WORKERS_PER_FILE", "2")))
-UPLOAD_CONCURRENCY = max(1, int(environ.get("UPLOAD_CONCURRENCY", "8")))
-SMALL_FILE_MAX_MB = int(environ.get("SMALL_FILE_MAX_MB", "50"))
-SMALL_FILE_MAX_BYTES = SMALL_FILE_MAX_MB * 1024 * 1024
-SMALL_WORKERS_CONFIG = int(environ.get("SMALL_WORKERS", "12"))
-LARGE_WORKERS_CONFIG = int(environ.get("LARGE_WORKERS", str(MAX_WORKERS)))
-if hasattr(UPLOAD_QUEUE, "small_file_max_bytes"):
-    UPLOAD_QUEUE.small_file_max_bytes = SMALL_FILE_MAX_BYTES
+MAX_WORKERS = max(1, int(environ.get("MAX_WORKERS", "28")))
+# Chunks remain 16 MB by default. These two limits are intentionally separate:
+# workers bound files claimed at once, while the limiter bounds Telegram RPCs.
+PART_WORKERS_PER_FILE = max(1, int(environ.get("PART_WORKERS_PER_FILE", "1")))
+UPLOAD_CONCURRENCY = max(1, int(environ.get("UPLOAD_CONCURRENCY", "24")))
+UPLOAD_CONCURRENCY_MAX = max(
+    1, int(environ.get("UPLOAD_CONCURRENCY_MAX", str(UPLOAD_CONCURRENCY)))
+)
+UPLOAD_CONCURRENCY_MIN = max(
+    1,
+    min(UPLOAD_CONCURRENCY_MAX, int(environ.get("UPLOAD_CONCURRENCY_MIN", "4"))),
+)
+UPLOAD_CONCURRENCY_START = max(
+    UPLOAD_CONCURRENCY_MIN,
+    min(UPLOAD_CONCURRENCY_MAX, int(environ.get("UPLOAD_CONCURRENCY_START", "20"))),
+)
+UPLOAD_METRICS_INTERVAL = max(5, int(environ.get("UPLOAD_METRICS_INTERVAL", "15")))
 STREAM_ONLY = environ.get("STREAM_ONLY", "false").lower() in ("1", "true", "yes")
 UPLOAD_STATUS_MESSAGES = environ.get("UPLOAD_STATUS_MESSAGES", "false").lower() in ("1", "true", "yes")
 STREAM_HOST = environ.get("STREAM_HOST", "127.0.0.1")
@@ -122,16 +136,101 @@ STAGING_DIRS = [
     for path in environ.get("STAGING_DIRS", environ.get("STAGING_DIR", "staging")).split(";")
     if path.strip()
 ]
+STAGE_SCAN_INTERVAL = max(5, int(environ.get("STAGE_SCAN_INTERVAL", "30")))
 _UPLOAD_SEMAPHORE = None
 _UPLOAD_SEMAPHORE_LOOP = None
 UPLOAD_BOT_CURSOR = 0
+BOT_COOLDOWNS = {}
+
+
+class AdaptiveUploadLimiter:
+    """Global RPC limiter with conservative additive increase / multiplicative decrease."""
+
+    def __init__(self, initial, minimum, maximum):
+        self.minimum = min(minimum, maximum)
+        self.maximum = maximum
+        self.limit = min(max(initial, self.minimum), self.maximum)
+        self.active = 0
+        self._condition = asyncio.Condition()
+        self._successes = 0
+        self._transport_failure_window_started = 0.0
+        self._transport_failures_in_window = 0
+        self._transport_backoff_applied = False
+
+    async def acquire(self):
+        async with self._condition:
+            while self.active >= self.limit:
+                await self._condition.wait()
+            self.active += 1
+
+    async def release(self):
+        async with self._condition:
+            self.active = max(0, self.active - 1)
+            self._condition.notify_all()
+
+    async def penalize(self, reason):
+        async with self._condition:
+            previous = self.limit
+            if reason == "connection-establishment":
+                self.limit = max(self.minimum, self.limit - 1)
+            elif reason == "bot-transport":
+                now = time.monotonic()
+                if now - self._transport_failure_window_started > 15:
+                    self._transport_failure_window_started = now
+                    self._transport_failures_in_window = 0
+                    self._transport_backoff_applied = False
+                self._transport_failures_in_window += 1
+                if self._transport_failures_in_window <= 2:
+                    self.limit = max(self.minimum, self.limit - 1)
+                elif not self._transport_backoff_applied:
+                    # Treat a burst as one congestion signal. Without this
+                    # latch, every failed in-flight request compounds the
+                    # backoff and can collapse 28 slots to the minimum at once.
+                    self.limit = max(self.minimum, self.limit - max(2, self.limit // 4))
+                    self._transport_backoff_applied = True
+            else:
+                self._transport_failures_in_window = 0
+                self._transport_failure_window_started = 0.0
+                self._transport_backoff_applied = False
+                self.limit = max(self.minimum, self.limit // 2)
+            self._successes = 0
+            self._condition.notify_all()
+        if self.limit != previous:
+            logger.warning("Concorrencia Telegram reduzida: %s -> %s (%s)", previous, self.limit, reason)
+
+    async def success(self):
+        async with self._condition:
+            self._successes += 1
+            if self._successes >= max(self.limit, 4) and self.limit < self.maximum:
+                self.limit += 1
+                self._successes = 0
+                self._condition.notify_all()
+                logger.info("Concorrencia Telegram elevada gradualmente para %s", self.limit)
+
+    def snapshot(self):
+        return {
+            "active_requests": self.active,
+            "request_limit": self.limit,
+            "request_limit_max": self.maximum,
+        }
+
+    async def __aenter__(self):
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, *_):
+        await self.release()
 
 
 def get_upload_semaphore():
     global _UPLOAD_SEMAPHORE, _UPLOAD_SEMAPHORE_LOOP
     loop = asyncio.get_running_loop()
     if _UPLOAD_SEMAPHORE is None or _UPLOAD_SEMAPHORE_LOOP is not loop:
-        _UPLOAD_SEMAPHORE = asyncio.Semaphore(UPLOAD_CONCURRENCY)
+        _UPLOAD_SEMAPHORE = AdaptiveUploadLimiter(
+            UPLOAD_CONCURRENCY_START,
+            min(UPLOAD_CONCURRENCY_MIN, UPLOAD_CONCURRENCY_START),
+            UPLOAD_CONCURRENCY_MAX,
+        )
         _UPLOAD_SEMAPHORE_LOOP = loop
     return _UPLOAD_SEMAPHORE
 
@@ -155,17 +254,8 @@ def is_loopback_host(host):
 
 
 def get_upload_worker_count(bot_count):
-    # Each worker uploads one file at a time using PART_WORKERS_PER_FILE parallel parts.
-    target_workers = max(1, bot_count // PART_WORKERS_PER_FILE)
-    concurrency_limit = max(UPLOAD_CONCURRENCY // PART_WORKERS_PER_FILE, bot_count // PART_WORKERS_PER_FILE, 1)
-    limit = max(MAX_WORKERS, LARGE_WORKERS_CONFIG)
-    return min(limit, concurrency_limit, target_workers)
-
-
-def get_small_upload_worker_count(bot_count):
-    """Number of dedicated workers for small files (<= 50MB, e.g. .jpg, .png, .nfo, subtitles)."""
-    configured = int(environ.get("SMALL_WORKERS", str(SMALL_WORKERS_CONFIG)))
-    return max(1, min(configured, bot_count))
+    """Files that may be active at once; distinct from in-flight part requests."""
+    return max(1, min(MAX_WORKERS, UPLOAD_CONCURRENCY_MAX, max(bot_count, 1)))
 
 
 def next_upload_bot_index(bot_count):
@@ -176,6 +266,33 @@ def next_upload_bot_index(bot_count):
     index = UPLOAD_BOT_CURSOR % bot_count
     UPLOAD_BOT_CURSOR = (UPLOAD_BOT_CURSOR + 1) % bot_count
     return index
+
+
+def next_available_upload_bot_index(bots):
+    """Round-robin a bot that is not cooling down, falling back if all wait."""
+    if not bots:
+        raise RuntimeError("Nenhum bot Telegram disponível para upload.")
+    now = time.monotonic()
+    start = next_upload_bot_index(len(bots))
+    for offset in range(len(bots)):
+        index = (start + offset) % len(bots)
+        if BOT_COOLDOWNS.get(id(bots[index]), 0) <= now:
+            return index
+    return start
+
+
+async def wait_for_available_upload_bot(bots):
+    """Wait only when every configured bot is still in cooldown."""
+    while bots:
+        now = time.monotonic()
+        deadlines = [BOT_COOLDOWNS.get(id(bot), 0) for bot in bots]
+        if any(deadline <= now for deadline in deadlines):
+            return
+        await asyncio.sleep(max(0.05, min(deadlines) - now))
+
+
+def is_rate_limit_error(exc):
+    return getattr(exc, "code", None) == 429 or "429" in str(exc) or "too many requests" in str(exc).lower()
 
 
 def get_contiguous_uploaded_parts(parts, total_parts=None):
@@ -235,6 +352,39 @@ def classify_media_type(parent: str, filename: str) -> str:
     return "FILME"
 
 
+def create_upload_strm(file_doc):
+    """Create the canonical STRM for one confirmed completed media upload."""
+    from generate_strm import create_completed_media_strm
+
+    output_root = Path(
+        environ.get("STRM_OUTPUT_DIR", str(Path(__file__).resolve().parent / "strm_library"))
+    ).expanduser().resolve()
+    library_user = environ.get("NEBULA_LIBRARY_USER", "raphael").strip("/")
+    base_url = f"http://{STREAM_HOST}:{STREAM_PORT}"
+    return create_completed_media_strm(
+        file_doc,
+        output_root=output_root,
+        stream_base_url=base_url,
+        library_user=library_user,
+    )
+
+
+def log_upload_strm_result(filename, file_doc):
+    """Log STRM failures without changing a successfully completed upload."""
+    try:
+        outcome, target = create_upload_strm(file_doc)
+    except Exception:
+        logger.exception("[STRM] Falha ao criar link da mídia concluída: %s", filename)
+        return
+
+    if outcome == "generated":
+        logger.info("[STRM] Criado: %s -> %s", filename, target)
+    elif outcome == "conflict":
+        logger.warning("[STRM] Conflito preservado para %s: %s", filename, target)
+    elif outcome == "ineligible":
+        logger.debug("[STRM] Arquivo concluído não é mídia elegível: %s", filename)
+
+
 def build_part_caption(media_type: str, filename: str, part_num: int, total_parts: int, file_uuid: str, real_size: int) -> str:
     """Gera legenda estruturada para visualização e reconstrução a partir do Telegram."""
     size_mb = real_size / (1024 * 1024) if real_size else 0
@@ -273,10 +423,13 @@ async def _send_part_on_idle_bot(
     chunk_data,
     chunk_name,
     caption="",
+    on_send_start=None,
 ):
     """Wait for capacity, reserve the bot, and release it before retries/backoff."""
     async with get_upload_semaphore():
         await _wait_for_streaming(bot)
+        if on_send_start is not None:
+            on_send_start()
         active_uploads = getattr(bot, "_nebula_uploads", 0)
         if not isinstance(active_uploads, int):
             active_uploads = 0
@@ -584,15 +737,43 @@ except Exception as log_err:
 
 # --- MÉTRICAS ---
 class Metrics:
-    uploads_total = 0; uploads_failed = 0; bytes_uploaded = 0
+    uploads_total = 0
+    uploads_failed = 0
+    bytes_uploaded = 0
+    started_at = time.monotonic()
+    _last_bytes = 0
+    _last_sample_at = started_at
+    _last_mbps = 0.0
+
     @classmethod
-    def log_success(cls, size): cls.uploads_total += 1; cls.bytes_uploaded += size
+    def log_success(cls, size): cls.uploads_total += 1
+
     @classmethod
     def log_fail(cls): cls.uploads_failed += 1
+
     @classmethod
-    def report(cls):
-        mb = cls.bytes_uploaded / (1024*1024)
-        logger.debug(f"Stats runtime: enviados={cls.uploads_total} volume={mb:.2f} MB falhas={cls.uploads_failed}")
+    def log_transferred(cls, size): cls.bytes_uploaded += size
+
+    @classmethod
+    def snapshot(cls, pending_bytes=0, sample=False):
+        if sample:
+            now = time.monotonic()
+            elapsed = max(now - cls._last_sample_at, 0.001)
+            bytes_delta = max(0, cls.bytes_uploaded - cls._last_bytes)
+            cls._last_mbps = bytes_delta / 1024 / 1024 / elapsed
+            cls._last_bytes = cls.bytes_uploaded
+            cls._last_sample_at = now
+        mbps = cls._last_mbps
+        eta_seconds = pending_bytes / (mbps * 1024 * 1024) if mbps > 0 else None
+        return {
+            "mb_s": mbps,
+            "mbps": mbps * 8,
+            "gb_h": mbps * 3600 / 1024,
+            "uploaded_mb": cls.bytes_uploaded / 1024 / 1024,
+            "completed": cls.uploads_total,
+            "errors": cls.uploads_failed,
+            "eta_seconds": eta_seconds,
+        }
 
 
 async def log_queue_state(mongo, event):
@@ -625,12 +806,32 @@ async def log_queue_state(mongo, event):
             log_fn = logger.debug
         elif event.startswith(("enfileirado:", "reenfileirado:")):
             log_fn = logger.debug
+        pending_bytes = 0
+        async for row in mongo.files.aggregate([
+            {"$match": {"type": "file", "status": {"$in": ["queued", "staging", "uploading"]}}},
+            {"$group": {"_id": None, "bytes": {"$sum": "$size"}}},
+        ]):
+            pending_bytes = int(row.get("bytes") or 0)
+        rate = Metrics.snapshot(pending_bytes, sample=event == "metricas")
+        limiter = get_upload_semaphore().snapshot()
+        eta = "--" if rate["eta_seconds"] is None else f"{rate['eta_seconds'] / 60:.1f}min"
         log_fn(
-            "Fila: evento=%s stage=%s fila=%s enviando=%s enviados=%s falhas=%s faltam=%s (no disco=%s)",
-            event, staging, queued, uploading, completed, failed, pending, pending_disk
+            "Fila: evento=%s stage=%s fila=%s enviando=%s concluidos=%s erros=%s pendentes=%s "
+            "ativos=%s limite=%s taxa=%.2f MB/s %.2f Mbps %.2f GB/h eta=%s (no disco=%s)",
+            event, staging, queued, uploading, completed, failed, pending,
+            limiter["active_requests"], limiter["request_limit"], rate["mb_s"],
+            rate["mbps"], rate["gb_h"], eta,
+            pending_disk,
         )
     except Exception as exc:
         logger.warning("Fila: falha ao calcular status: %s", exc)
+
+
+async def upload_metrics_reporter(mongo):
+    """Emit aggregate throughput and queue health at a predictable interval."""
+    while True:
+        await log_queue_state(mongo, "metricas")
+        await asyncio.sleep(UPLOAD_METRICS_INTERVAL)
 
 
 EPISODE_RE = re.compile(r"(?i)(?P<prefix>.*?)(?:[.\s_-]+)?s(?P<season>\d{1,2})e(?P<episode>\d{1,3})")
@@ -1083,9 +1284,6 @@ async def queued_mongo_scanner(mongo, max_workers=None):
     while True:
         try:
             found = 0
-            # If large lane is running low, prioritize pulling large files so large workers never starve
-            large_needed = hasattr(UPLOAD_QUEUE, "large_qsize") and UPLOAD_QUEUE.large_qsize() < 6
-
             for _ in range(batch_limit):
                 # Registros cujo stage sumiu ficam preservados para recuperação,
                 # mas não devem ser revendidos em loop a cada segundo.
@@ -1095,26 +1293,11 @@ async def queued_mongo_scanner(mongo, max_workers=None):
                     "local_path": {"$exists": True},
                     "recovery_required": {"$ne": True},
                 }
-                doc = None
-                if large_needed:
-                    q_large = dict(q)
-                    q_large["size"] = {"$gt": SMALL_FILE_MAX_BYTES}
-                    doc = await mongo.files.find_one_and_update(
-                        q_large,
-                        {"$set": {"status": "staging", "staged_at": int(time.time())}},
-                        sort=[("mtime", 1), ("ctime", 1), ("_id", 1)],
-                    )
-                    if doc:
-                        large_needed = hasattr(UPLOAD_QUEUE, "large_qsize") and UPLOAD_QUEUE.large_qsize() < 6
-                    else:
-                        large_needed = False
-
-                if not doc:
-                    doc = await mongo.files.find_one_and_update(
-                        q,
-                        {"$set": {"status": "staging", "staged_at": int(time.time())}},
-                        sort=[("mtime", 1), ("ctime", 1), ("_id", 1)],
-                    )
+                doc = await mongo.files.find_one_and_update(
+                    q,
+                    {"$set": {"status": "staging", "staged_at": int(time.time())}},
+                    sort=[("mtime", 1), ("ctime", 1), ("_id", 1)],
+                )
                 if not doc:
                     break
                 try:
@@ -1171,6 +1354,31 @@ async def queued_mongo_scanner(mongo, max_workers=None):
         await asyncio.sleep(1)
 
 
+def _collect_stage_uploadable_files(stage_root):
+    """Walk one stage tree off-loop and return eligible files with one stat each."""
+    stage_path = Path(stage_root)
+    if not stage_path.exists():
+        return []
+    candidates = []
+    for file_path in stage_path.rglob("*"):
+        name = file_path.name
+        if (
+            not is_uploadable_name(name)
+            or name.startswith(".")
+            or ".part" in name.lower()
+            or name.endswith(".download")
+        ):
+            continue
+        try:
+            file_stat = file_path.stat()
+        except OSError:
+            continue
+        if not stat_module.S_ISREG(file_stat.st_mode) or file_stat.st_size <= 0:
+            continue
+        candidates.append((file_path, file_stat.st_size, int(file_stat.st_mtime), int(file_stat.st_ctime)))
+    return candidates
+
+
 async def staging_scanner(mongo, staging_dirs):
     """Monitora pastas de stage (STAGING_DIRS) e registra arquivos pendentes/orfãos no MongoDB."""
     logger.info("Iniciando scanner de pastas de stage: %s", staging_dirs)
@@ -1178,24 +1386,16 @@ async def staging_scanner(mongo, staging_dirs):
         try:
             for stage_root in staging_dirs:
                 stage_path = Path(stage_root)
-                if not stage_path.exists():
-                    continue
                 # Busca todos os formatos aceitos pelo pipeline.  Manter uma
                 # lista separada de extensoes de video fazia imagens, audios
                 # e legendas enviadas ao Telegram desaparecerem da arvore.
-                for file_path in stage_path.rglob("*"):
-                    if file_path.is_file() and is_uploadable_name(file_path.name):
-                        # Ignora arquivos temporarios ou de download parcial
-                        name_str = file_path.name
-                        if name_str.startswith(".") or ".part" in name_str.lower() or name_str.endswith(".download"):
-                            continue
-                        try:
-                            size = file_path.stat().st_size
-                            if size == 0:
-                                continue
-                            file_stat = file_path.stat()
-                            file_mtime = int(file_stat.st_mtime)
-                            file_ctime = int(file_stat.st_ctime)
+                stage_candidates = await asyncio.to_thread(
+                    _collect_stage_uploadable_files, stage_path
+                )
+                for file_path, size, file_mtime, file_ctime in stage_candidates:
+                    # File metadata and recursive traversal were captured in a
+                    # worker thread so slow disks cannot stall FTP/HTTP tasks.
+                    try:
 
                             # Inferir nome da midia
                             inferred_name = file_path.name
@@ -1274,11 +1474,11 @@ async def staging_scanner(mongo, staging_dirs):
                             except DuplicateKeyError:
                                 safe_remove_staging_file(str(file_path), force_delete=True)
                                 logger.warning("Stage scanner: arquivo duplicado descartado do stage local: %s", file_path)
-                        except Exception as e:
-                            logger.warning("Stage scanner erro em %s: %s", file_path, e)
+                    except Exception as e:
+                        logger.warning("Stage scanner erro em %s: %s", file_path, e)
         except Exception as exc:
             logger.warning("Stage scanner aguardando: %s", exc)
-        await asyncio.sleep(5)
+        await asyncio.sleep(STAGE_SCAN_INTERVAL)
 
 
 async def upload_part_with_retries(worker_id, bots, target_chat_id, local_path, file_uuid, part_num, chunk_data=None, bot_index_offset=0, caption=""):
@@ -1303,7 +1503,7 @@ async def upload_part_with_retries(worker_id, bots, target_chat_id, local_path, 
     # traffic on the same worker-specific subset of bots.
     if not bots:
         raise RuntimeError("Nenhum bot Telegram disponível para upload. Verifique os tokens configurados.")
-    current_bot_idx = next_upload_bot_index(len(bots))
+    current_bot_idx = next_available_upload_bot_index(bots)
     sent_msg = None
     attempt = 1
     while attempt <= MAX_RETRIES:
@@ -1311,35 +1511,82 @@ async def upload_part_with_retries(worker_id, bots, target_chat_id, local_path, 
         bot_number = bot_index_offset + (current_bot_idx % len(bots)) + 1
         bot_name = getattr(part_bot, "name", None)
         try:
-            started_at = time.monotonic()
-            logger.info("[UPLOAD] W%s parte=%s bot=#%s iniciando", worker_id, part_num, bot_number)
+            queued_at = time.monotonic()
+            send_started_at = None
+
+            def mark_send_started():
+                nonlocal send_started_at
+                send_started_at = time.monotonic()
+                logger.info(
+                    "[UPLOAD] W%s parte=%s bot=#%s iniciando (espera_slot=%.1fs)",
+                    worker_id,
+                    part_num,
+                    bot_number,
+                    send_started_at - queued_at,
+                )
+
             sent_msg = await _send_part_on_idle_bot(
                 part_bot,
                 target_chat_id,
                 chunk_data,
                 chunk_name,
                 caption=caption,
+                on_send_start=mark_send_started,
             )
             if sent_msg is None:
                 raise RuntimeError("Telegram encerrou o upload sem retornar mensagem")
-            elapsed = max(time.monotonic() - started_at, 0.001)
+            elapsed = max(time.monotonic() - send_started_at, 0.001)
             logger.info(
                 "[UPLOAD] W%s parte=%s bot=#%s concluida em %.1fs (%.2f MB/s)",
                 worker_id, part_num, bot_number, elapsed,
                 len(chunk_data) / 1024 / 1024 / elapsed,
             )
+            Metrics.log_transferred(len(chunk_data))
+            await get_upload_semaphore().success()
             break
         except FloodWait as e:
             w = e.value + 2
+            BOT_COOLDOWNS[id(part_bot)] = time.monotonic() + w
+            await get_upload_semaphore().penalize("FloodWait")
             logger.warning(
                 f"[W{worker_id}] FloodWait bot#{bot_number}: {w}s, "
                 f"rotating to next bot"
             )
             attempt += 1
-            current_bot_idx += 1
-            if len(bots) == 1:
-                await asyncio.sleep(w)
+            current_bot_idx = next_available_upload_bot_index(bots)
+            await wait_for_available_upload_bot(bots)
+        except TelegramBotAPIError as e:
+            is_429 = e.status == 429 or e.code == 429
+            cooldown = max(e.retry_after, 1) if is_429 else 2 ** attempt
+            BOT_COOLDOWNS[id(part_bot)] = time.monotonic() + cooldown
+            if is_429:
+                await get_upload_semaphore().penalize("RPC 429")
+                logger.warning(
+                    "[W%s] Telegram Bot API 429 no bot#%s; retry_after=%ss, rotacionando",
+                    worker_id,
+                    bot_number,
+                    cooldown,
+                )
+            else:
+                logger.error(
+                    "[W%s] Telegram Bot API rejeitou upload no bot#%s: %s",
+                    worker_id,
+                    bot_number,
+                    e,
+                )
+            attempt += 1
+            current_bot_idx = next_available_upload_bot_index(bots)
+            await wait_for_available_upload_bot(bots)
         except (TimeoutError, ConnectionError) as e:
+            BOT_COOLDOWNS[id(part_bot)] = time.monotonic() + 2
+            error_text = str(e)
+            if "ClientConnectorError" in error_text:
+                penalty = "connection-establishment"
+            elif "Telegram Bot API transport failed:" in error_text:
+                penalty = "bot-transport"
+            else:
+                penalty = "timeout/rede"
+            await get_upload_semaphore().penalize(penalty)
             logger.warning(
                 "[W%s] Timeout bot#%s: %s; rotating to next bot",
                 worker_id,
@@ -1347,9 +1594,13 @@ async def upload_part_with_retries(worker_id, bots, target_chat_id, local_path, 
                 e,
             )
             attempt += 1
-            current_bot_idx += 1
+            current_bot_idx = next_available_upload_bot_index(bots)
             await asyncio.sleep(1)
         except RPCError as e:
+            if is_rate_limit_error(e):
+                BOT_COOLDOWNS[id(part_bot)] = time.monotonic() + (2 ** attempt)
+                await get_upload_semaphore().penalize("RPC 429")
+                current_bot_idx = next_available_upload_bot_index(bots)
             w = 2 ** attempt
             logger.error(f"[W{worker_id}] Erro TG ({attempt}) bot#{bot_number}: {e}")
             attempt += 1
@@ -1547,7 +1798,7 @@ async def upload_worker(bot, target_chat_id, mongo, worker_id, bot_index=0):
 
             if not upload_failed:
                 parts_metadata.sort(key=lambda item: item["part_id"])
-                await mongo.files.update_one(
+                completion_result = await mongo.files.update_one(
                     {"_id": file_doc["_id"]},
                     {
                         "$set": {
@@ -1565,6 +1816,17 @@ async def upload_worker(bot, target_chat_id, mongo, worker_id, bot_index=0):
                         "$unset": {"uploadId": 1, "local_path": 1},
                     }
                 )
+                if completion_result.matched_count != 1:
+                    raise RuntimeError("Registro Mongo não confirmou a conclusão do upload")
+                log_upload_strm_result(filename, {
+                    **file_doc,
+                    "type": "file",
+                    "name": filename,
+                    "parent": parent,
+                    "size": real_size,
+                    "parts": parts_metadata,
+                    "status": "completed",
+                })
                 async with MongoDBPathIO._cache_lock:
                     MongoDBPathIO._memory_cache.pop(f"{parent}::{filename}", None)
                 logger.info(f"[W{worker_id}] Concluido: {filename}")
@@ -1584,7 +1846,7 @@ async def upload_worker(bot, target_chat_id, mongo, worker_id, bot_index=0):
             UPLOAD_QUEUE.task_done()
 
 async def upload_worker_parallel(bots, target_chat_id, mongo, worker_id):
-    """Upload worker with bot rotation and read-ahead.
+    """Unified file worker with bot rotation and read-ahead.
 
     Each worker now receives the full ``bots[]`` list so that parts within
     a batch are distributed across bots, and a single bot's FloodWait
@@ -1594,11 +1856,7 @@ async def upload_worker_parallel(bots, target_chat_id, mongo, worker_id):
     logger.debug(f"Worker #{worker_id} pronto (bots={len(bots)}, partes={PART_WORKERS_PER_FILE})")
     while True:
         try:
-            get_fn = getattr(UPLOAD_QUEUE, "get_large", None)
-            if callable(get_fn):
-                task = await asyncio.wait_for(get_fn(fallback_to_small=True), timeout=2.0)
-            else:
-                task = await asyncio.wait_for(UPLOAD_QUEUE.get(), timeout=2.0)
+            task = await asyncio.wait_for(UPLOAD_QUEUE.get(), timeout=2.0)
         except TimeoutError:
             continue
 
@@ -1699,7 +1957,7 @@ async def upload_worker_parallel(bots, target_chat_id, mongo, worker_id):
                     chunk_data = chunk_map.get(pn)
                     caption = build_part_caption(media_type, filename, pn, total_parts, file_uuid, real_size)
                     return await upload_part_with_retries(
-                        worker_id, bots, target_chat_id, local_path, file_uuid, pn, chunk_data, 1, caption=caption
+                        worker_id, bots, target_chat_id, local_path, file_uuid, pn, chunk_data, caption=caption
                     )
 
                 results = await asyncio.gather(
@@ -1735,7 +1993,7 @@ async def upload_worker_parallel(bots, target_chat_id, mongo, worker_id):
                 (item.get("bot_name") for item in parts_metadata if item.get("bot_name")),
                 None,
             )
-            await mongo.files.update_one(
+            completion_result = await mongo.files.update_one(
                 {"_id": file_doc["_id"]},
                 {
                     "$set": {
@@ -1753,6 +2011,17 @@ async def upload_worker_parallel(bots, target_chat_id, mongo, worker_id):
                     "$unset": {"uploadId": 1, "local_path": 1},
                 },
             )
+            if completion_result.matched_count != 1:
+                raise RuntimeError("Registro Mongo não confirmou a conclusão do upload")
+            log_upload_strm_result(filename, {
+                **file_doc,
+                "type": "file",
+                "name": filename,
+                "parent": parent,
+                "size": real_size,
+                "parts": parts_metadata,
+                "status": "completed",
+            })
             async with MongoDBPathIO._cache_lock:
                 MongoDBPathIO._memory_cache.pop(f"{parent}::{filename}", None)
             logger.info(f"[W{worker_id}] Concluido: {filename}")
@@ -1762,109 +2031,6 @@ async def upload_worker_parallel(bots, target_chat_id, mongo, worker_id):
             safe_remove_staging_file(local_path, force_delete=force_del)
         except Exception as exc:
             logger.error(f"[W{worker_id}] Abortado: {filename}: {exc}")
-            Metrics.log_fail()
-            with contextlib.suppress(Exception):
-                await mongo.files.update_one(
-                    {"name": filename, "local_path": local_path},
-                    {"$set": {"status": "failed", "failed_at": int(time.time()), "failed_reason": str(exc)}},
-                )
-            await log_queue_state(mongo, f"falha:{filename}")
-        finally:
-            ACTIVE_UPLOADS.discard(local_path)
-            UPLOAD_QUEUE.task_done()
-
-
-async def upload_small_file_worker(bots, target_chat_id, mongo, worker_id):
-    """Dedicated fast-lane worker for small files (<= 50MB, e.g. .jpg, .png, .nfo, subtitles).
-
-    Bypasses read-ahead chunking and multi-part overhead, uploading single-part files directly
-    across rotating bots to clear the queue and free staging disk space immediately.
-    """
-    logger.debug(f"[SmallW#{worker_id}] Pronto (bots={len(bots)})")
-    while True:
-        try:
-            get_fn = getattr(UPLOAD_QUEUE, "get_small", None)
-            if callable(get_fn):
-                task = await asyncio.wait_for(get_fn(), timeout=2.0)
-            else:
-                task = await asyncio.wait_for(UPLOAD_QUEUE.get(), timeout=2.0)
-        except TimeoutError:
-            continue
-
-        local_path = task["path"]
-        filename = task["filename"]
-        parent = task["parent"]
-        ACTIVE_UPLOADS.add(local_path)
-        try:
-            if filename.endswith(".partial") or not os.path.exists(local_path):
-                continue
-            real_size = os.path.getsize(local_path)
-            if real_size == 0:
-                safe_remove_staging_file(local_path)
-                continue
-
-            # If misrouted or file grew beyond small threshold, route to large queue
-            if real_size > SMALL_FILE_MAX_BYTES:
-                await UPLOAD_QUEUE.put({"path": local_path, "filename": filename, "parent": parent, "size": real_size})
-                continue
-
-            parent = await resolve_media_parent(mongo, parent, filename)
-            file_doc = await mongo.files.find_one({"name": filename, "parent": parent})
-            if not file_doc:
-                file_doc = await mongo.files.find_one({"name": filename, "local_path": local_path})
-            if not file_doc:
-                logger.warning(f"[SmallW{worker_id}] Metadados nao encontrados: {filename}")
-                continue
-
-            file_doc = await mongo.files.find_one_and_update(
-                {"_id": file_doc["_id"], "status": {"$in": ["queued", "staging"]}},
-                {"$set": {"parent": parent, "status": "uploading", "worker_id": f"small_{worker_id}", "started_at": int(time.time())}},
-                return_document=ReturnDocument.AFTER,
-            )
-            if not file_doc:
-                logger.info(f"[SmallW{worker_id}] Ignorado ja processado: {filename}")
-                continue
-            await log_queue_state(mongo, f"inicio:{filename}")
-
-            media_type = classify_media_type(parent, filename)
-            file_uuid = str(uuid.uuid4())
-            async with aiofiles.open(local_path, "rb") as f:
-                chunk_data = await f.read()
-
-            caption = build_part_caption(media_type, filename, 0, 1, file_uuid, real_size)
-            part_result = await upload_part_with_retries(
-                f"S{worker_id}", bots, target_chat_id, local_path, file_uuid, 0, chunk_data, 1, caption=caption
-            )
-
-            parts_metadata = [part_result]
-            stream_bot_name = part_result.get("bot_name")
-            await mongo.files.update_one(
-                {"_id": file_doc["_id"]},
-                {
-                    "$set": {
-                        "size": real_size,
-                        "media_type": media_type,
-                        "part_count": 1,
-                        "uploaded_at": int(time.time()),
-                        "parts": parts_metadata,
-                        "obfuscated_id": file_uuid,
-                        "status": "completed",
-                        "stream_bot_name": stream_bot_name,
-                        "search_name": filename.lower(),
-                        "search_parent": parent.lower(),
-                    },
-                    "$unset": {"uploadId": 1, "local_path": 1},
-                },
-            )
-            async with MongoDBPathIO._cache_lock:
-                MongoDBPathIO._memory_cache.pop(f"{parent}::{filename}", None)
-            logger.info(f"[SmallW{worker_id}] Concluido: {filename} ({real_size / 1024:.1f} KB)")
-            await log_queue_state(mongo, f"concluido:{filename}")
-            Metrics.log_success(real_size)
-            force_del = bool(file_doc.get("delete_source")) if file_doc else False
-            safe_remove_staging_file(local_path, force_delete=force_del)
-        except Exception as exc:
-            logger.error(f"[SmallW{worker_id}] Abortado: {filename}: {exc}")
             Metrics.log_fail()
             with contextlib.suppress(Exception):
                 await mongo.files.update_one(
@@ -2403,7 +2569,9 @@ async def main():
     # Modo degradado: sem bots, FTP funciona mas sem upload para Telegram
     if bots:
         materializer_bot = bots[0]
-        upload_bots = bots[1:] or bots
+        # The primary bot is safe to upload after channel resolution.  It uses
+        # the same one-request reservation and cooldown as every other bot.
+        upload_bots = bots
 
         target_chat_id = await resolve_channel(materializer_bot)
         if not target_chat_id:
@@ -2412,7 +2580,7 @@ async def main():
             upload_bots = []
             target_chat_id = None
         else:
-            confirm_bots = upload_bots if upload_bots is not bots else bots[1:]
+            confirm_bots = bots[1:]
             failed_confirm = []
             for idx, bot in enumerate(confirm_bots, start=2 if len(bots) > 1 else 1):
                 try:
@@ -2426,7 +2594,7 @@ async def main():
                     failed_confirm.append(bot)
             if failed_confirm:
                 bots = [b for b in bots if b not in failed_confirm]
-                upload_bots = bots[1:] or bots
+                upload_bots = bots
                 if bots:
                     logger.info(
                         "Bots confirmados no canal: %s de %s.",
@@ -2505,6 +2673,8 @@ async def main():
         asyncio.create_task(garbage_collector(mongo)),
         asyncio.create_task(stats_reporter(mongo)),
         asyncio.create_task(staging_scanner(mongo, STAGING_DIRS)),
+        asyncio.create_task(upload_metrics_reporter(mongo)),
+        asyncio.create_task(media_cache_maintenance()),
     ]
     folder_task = None
     # Initialize upload semaphore with correct bot count
@@ -2518,13 +2688,11 @@ async def main():
         background_tasks.append(folder_task)
         await restore_pending_uploads(mongo)
         upload_worker_count = get_upload_worker_count(len(upload_bots))
-        small_worker_count = get_small_upload_worker_count(len(upload_bots))
         logger.info(
-            "Workers de upload ativos: %s grandes / %s pequenos (configurados: max_grandes=%s, max_pequenos=%s, bots=%s).",
+            "Workers de upload ativos: arquivos=%s; concorrencia inicial=%s, maxima=%s; bots=%s.",
             upload_worker_count,
-            small_worker_count,
-            LARGE_WORKERS_CONFIG,
-            SMALL_WORKERS_CONFIG,
+            UPLOAD_CONCURRENCY_START,
+            UPLOAD_CONCURRENCY_MAX,
             len(upload_bots),
         )
         background_tasks.append(
@@ -2535,10 +2703,6 @@ async def main():
         for i in range(upload_worker_count):
             background_tasks.append(
                 asyncio.create_task(upload_worker_parallel(upload_bots, target_chat_id, mongo, i + 1))
-            )
-        for i in range(small_worker_count):
-            background_tasks.append(
-                asyncio.create_task(upload_small_file_worker(upload_bots, target_chat_id, mongo, i + 1))
             )
 
     ftp_server_task = asyncio.create_task(server.serve_forever())
@@ -2645,6 +2809,7 @@ async def main():
         for task in background_tasks:
             task.cancel()
         await asyncio.gather(*background_tasks, return_exceptions=True)
+        await close_upload_http_sessions(bots)
         for bot in bots:
             await bot.stop()
         logger.info("👋 Desligado.")

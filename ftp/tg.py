@@ -161,6 +161,16 @@ def install_reliable_upload():
     Methods.save_file = sequential_save_file
 
 
+class TelegramBotAPIError(ConnectionError):
+    """Structured rejection returned by Telegram's Bot API."""
+
+    def __init__(self, message, *, status, error_code, retry_after=0):
+        super().__init__(message)
+        self.status = status
+        self.code = error_code
+        self.retry_after = max(0, int(retry_after or 0))
+
+
 async def send_document_bot_api(bot, chat_id, data, file_name, caption=""):
     token = getattr(bot, "_nebula_bot_token", None)
     if not isinstance(token, str) or not token:
@@ -179,22 +189,31 @@ async def send_document_bot_api(bot, chat_id, data, file_name, caption=""):
     )
     timeout = aiohttp.ClientTimeout(total=900, sock_connect=30, sock_read=900)
     try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(
-                f"https://api.telegram.org/bot{token}/sendDocument",
-                data=form,
-            ) as response:
-                payload = await response.json(content_type=None)
+        session = getattr(bot, "_nebula_http_session", None)
+        if session is None or session.closed:
+            session = aiohttp.ClientSession(timeout=timeout)
+            bot._nebula_http_session = session
+        async with session.post(
+            f"https://api.telegram.org/bot{token}/sendDocument",
+            data=form,
+        ) as response:
+            payload = await response.json(content_type=None)
     except (aiohttp.ClientError, TimeoutError, ValueError) as exc:
         raise ConnectionError(
             f"Telegram Bot API transport failed: {type(exc).__name__}"
         ) from exc
 
     if not payload.get("ok"):
-        raise ConnectionError(
+        parameters = payload.get("parameters") or {}
+        error_code = payload.get("error_code")
+        retry_after = parameters.get("retry_after", 0)
+        raise TelegramBotAPIError(
             "Telegram Bot API rejected upload: "
-            f"HTTP {response.status}, code={payload.get('error_code')}, "
-            f"description={payload.get('description', 'unknown')}"
+            f"HTTP {response.status}, code={error_code}, "
+            f"description={payload.get('description', 'unknown')}",
+            status=response.status,
+            error_code=error_code,
+            retry_after=retry_after,
         )
     result = payload.get("result") or {}
     document = result.get("document") or {}
@@ -204,6 +223,14 @@ async def send_document_bot_api(bot, chat_id, data, file_name, caption=""):
         id=result["message_id"],
         document=SimpleNamespace(file_id=document["file_id"]),
     )
+
+
+async def close_upload_http_sessions(bots):
+    """Close pooled Bot API sessions before stopping the Telegram clients."""
+    for bot in bots:
+        session = getattr(bot, "_nebula_http_session", None)
+        if session is not None and not session.closed:
+            await session.close()
 
 
 def get_file_limit(offset):

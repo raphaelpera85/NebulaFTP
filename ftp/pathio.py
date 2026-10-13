@@ -1,9 +1,12 @@
+import asyncio
+import contextlib
+import hashlib
 import logging
 import os
 import re
 import shutil
 import unicodedata
-from asyncio import CancelledError, Lock, gather, get_event_loop
+from asyncio import CancelledError, Lock, Semaphore, gather, get_event_loop
 from asyncio import sleep as asleep
 from collections import OrderedDict, namedtuple
 from functools import wraps
@@ -59,7 +62,109 @@ VISIBLE_CATEGORY_ROOTS = frozenset({
 __all__ = (
     "AbstractPathIO", "PathIONursery", "MongoDBPathIO", "BoundedLRUCache",
     "is_uploadable_name", "movie_folder_score", "resolve_part_bot", "resolve_part_bots",
+    "media_cache_maintenance",
 )
+
+
+def _media_cache_paths(node):
+    if not node.id or int(node.size or 0) <= 0:
+        return None, None
+    # Telegram file references can be refreshed in-place after expiration.
+    # They identify a transport location, not the media, and must not orphan
+    # a valid disk cache when that happens.
+    identity = f"{node.id}:{node.size}:{node.mtime}"
+    key = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return (
+        os.path.join(MEDIA_CACHE_DIR, f"{key}.cache"),
+        os.path.join(MEDIA_CACHE_DIR, f"{key}.part"),
+    )
+
+
+def _media_cache_overlaps_staging():
+    cache_path = os.path.normcase(os.path.realpath(MEDIA_CACHE_DIR))
+    for staging_dir in CACHE_DIRS:
+        staging_path = os.path.normcase(os.path.realpath(staging_dir))
+        try:
+            if os.path.commonpath((cache_path, staging_path)) == staging_path:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _cleanup_expired_media_cache_sync(now=None):
+    if _media_cache_overlaps_staging():
+        return 0
+    now = time() if now is None else now
+    try:
+        entries = os.scandir(MEDIA_CACHE_DIR)
+    except OSError:
+        return 0
+    removed = 0
+    with entries:
+        for entry in entries:
+            if not re.fullmatch(r"[0-9a-f]{64}\.(?:cache|part)", entry.name):
+                continue
+            path = entry.path
+            cache_path = path[:-5] + ".cache" if entry.name.endswith(".part") else path
+            if path in _MEDIA_CACHE_ACTIVE_PATHS or cache_path in _MEDIA_CACHE_DOWNLOADS:
+                continue
+            try:
+                last_access = max(
+                    _MEDIA_CACHE_LAST_ACCESS.get(path, 0),
+                    entry.stat(follow_symlinks=False).st_mtime,
+                )
+                if now - last_access < MEDIA_CACHE_TTL_SECONDS:
+                    continue
+                os.remove(path)
+                _MEDIA_CACHE_LAST_ACCESS.pop(path, None)
+                removed += 1
+            except OSError:
+                continue
+    return removed
+
+
+async def cleanup_expired_media_cache():
+    return await asyncio.to_thread(_cleanup_expired_media_cache_sync)
+
+
+async def cancel_inactive_media_cache_downloads(now=None):
+    """Stop background prefetches once the media has been idle for its cache TTL."""
+    now = time() if now is None else now
+    async with _MEDIA_CACHE_LOCK:
+        inactive = [
+            task
+            for cache_path, task in _MEDIA_CACHE_DOWNLOADS.items()
+            if not task.done()
+            and now - _MEDIA_CACHE_LAST_ACCESS.get(cache_path, 0) >= MEDIA_CACHE_TTL_SECONDS
+        ]
+        for task in inactive:
+            task.cancel()
+
+    if inactive:
+        await asyncio.gather(*inactive, return_exceptions=True)
+    return len(inactive)
+
+
+async def media_cache_maintenance():
+    try:
+        while True:
+            cancelled = await cancel_inactive_media_cache_downloads()
+            if cancelled:
+                logger.info(
+                    "Pré-carregamento de cache cancelado por inatividade: %s tarefa(s).",
+                    cancelled,
+                )
+            removed = await cleanup_expired_media_cache()
+            if removed:
+                logger.info("Cache de mídia expirado: %s arquivo(s) removido(s).", removed)
+            await asyncio.sleep(min(15, MEDIA_CACHE_TTL_SECONDS))
+    finally:
+        tasks = list(_MEDIA_CACHE_DOWNLOADS.values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 def get_free_bytes(path: str) -> int:
     """Retorna os bytes livres no disco correspondente ao caminho."""
@@ -109,6 +214,20 @@ CACHE_DIRS = [
     if path.strip()
 ]
 CACHE_DIR = get_cache_dir()
+MEDIA_CACHE_DIR = os.path.abspath(
+    environ.get("MEDIA_CACHE_DIR")
+    or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "media-cache")
+)
+MEDIA_CACHE_TTL_SECONDS = max(1, int(environ.get("MEDIA_CACHE_TTL_SECONDS", "900")))
+MEDIA_CACHE_MAX_GB = max(1, int(environ.get("MEDIA_CACHE_MAX_GB", "100")))
+MEDIA_CACHE_MAX_BYTES = MEDIA_CACHE_MAX_GB * 1024**3
+_MEDIA_CACHE_LOCK = Lock()
+_MEDIA_CACHE_PREFETCH_LIMIT = Semaphore(2)
+_MEDIA_CACHE_DOWNLOADS = {}
+_MEDIA_CACHE_ACTIVE_PATHS = set()
+_MEDIA_CACHE_READERS = {}
+_MEDIA_CACHE_LAST_ACCESS = {}
+_MEDIA_CACHE_RESERVED_BYTES = 0
 UPLOADABLE_EXTENSIONS = {
     ".mkv", ".mp4", ".avi", ".mov", ".wmv", ".m4v",
     ".ts", ".webm", ".flv", ".mpeg", ".mpg", ".m2ts", ".3gp",
@@ -288,15 +407,46 @@ class Node:
         self.id = k.get("_id")
 
 class MongoDBMemoryIO:
-    def __init__(self, node, mode, tg, db):
+    def __init__(self, node, mode, tg, db, cache_enabled=True):
         self._node = node; self._mode = mode; self._tg = tg; self._db = db
+        self._cache_enabled = cache_enabled
+        self._cache_reader_path = None
         self.offset = 0
         self.safe_name = f"{uuid4().hex}_{node.name}"
         cache_dir = get_cache_dir()
         self.local_path = os.path.join(cache_dir, self.safe_name)
 
     async def __aenter__(self): return self
-    async def __aexit__(self, *args, **kwargs): pass
+    async def __aexit__(self, *args, **kwargs):
+        await self._release_media_cache_reader()
+
+    async def _register_media_cache_reader(self, cache_path):
+        async with _MEDIA_CACHE_LOCK:
+            self._cache_reader_path = cache_path
+            _MEDIA_CACHE_READERS[cache_path] = _MEDIA_CACHE_READERS.get(cache_path, 0) + 1
+            _MEDIA_CACHE_LAST_ACCESS[cache_path] = time()
+
+    async def _release_media_cache_reader(self):
+        cache_path = self._cache_reader_path
+        if not cache_path:
+            return
+        self._cache_reader_path = None
+        prefetch_task = None
+        async with _MEDIA_CACHE_LOCK:
+            readers = max(0, _MEDIA_CACHE_READERS.get(cache_path, 0) - 1)
+            if readers:
+                _MEDIA_CACHE_READERS[cache_path] = readers
+            else:
+                _MEDIA_CACHE_READERS.pop(cache_path, None)
+                prefetch_task = _MEDIA_CACHE_DOWNLOADS.get(cache_path)
+                if prefetch_task and not prefetch_task.done():
+                    prefetch_task.cancel()
+        if prefetch_task and not prefetch_task.done():
+            await asyncio.gather(prefetch_task, return_exceptions=True)
+            logger.info(
+                "Pré-carregamento cancelado após o último leitor fechar: %s",
+                self._node.name,
+            )
     async def seek(self, offset=0): self.offset = offset
 
     async def write_stream(self, stream):
@@ -356,20 +506,178 @@ class MongoDBMemoryIO:
         else:
              logger.debug("[WRITE] Arquivo salvo em staging: %s", name)
 
-    async def iter_by_block(self, block_size):
-        if self._node.local_path and os.path.exists(self._node.local_path):
-            async with aiofiles.open(self._node.local_path, 'rb') as f:
+    async def _iter_local_file(self, path, block_size, touch_cache=False):
+        last_touch = time()
+        if touch_cache:
+            async with _MEDIA_CACHE_LOCK:
+                _MEDIA_CACHE_ACTIVE_PATHS.add(path)
+            with contextlib.suppress(OSError):
+                os.utime(path, None)
+        try:
+            async with aiofiles.open(path, "rb") as f:
                 await f.seek(self.offset)
                 while True:
                     chunk = await f.read(block_size)
-                    if not chunk: break
+                    if not chunk:
+                        break
+                    now = time()
+                    if touch_cache and now - last_touch >= 60:
+                        os.utime(path, None)
+                        last_touch = now
                     yield chunk
+        finally:
+            if touch_cache:
+                async with _MEDIA_CACHE_LOCK:
+                    _MEDIA_CACHE_ACTIVE_PATHS.discard(path)
+
+    async def _start_media_cache_download(self):
+        global _MEDIA_CACHE_RESERVED_BYTES
+        cache_path, partial_path = _media_cache_paths(self._node)
+        if not cache_path:
+            return None
+        if _media_cache_overlaps_staging():
+            logger.error("Cache de mídia desativado: MEDIA_CACHE_DIR não pode ficar dentro do staging.")
+            return None
+        expected_size = int(self._node.size)
+        try:
+            os.makedirs(MEDIA_CACHE_DIR, exist_ok=True)
+        except OSError as exc:
+            logger.warning("Cache de mídia indisponível em %s: %s", MEDIA_CACHE_DIR, exc)
+            return None
+
+        if os.path.isfile(cache_path):
+            try:
+                if os.path.getsize(cache_path) == expected_size:
+                    os.utime(cache_path, None)
+                    return cache_path
+                os.remove(cache_path)
+            except OSError:
+                pass
+
+        async with _MEDIA_CACHE_LOCK:
+            if os.path.isfile(cache_path) and os.path.getsize(cache_path) == expected_size:
+                os.utime(cache_path, None)
+                return cache_path
+            current = _MEDIA_CACHE_DOWNLOADS.get(cache_path)
+            if current and not current.done():
+                return None
+            if expected_size > MEDIA_CACHE_MAX_BYTES:
+                logger.info(
+                    "Cache ignorado para %s: arquivo excede limite de %s GB.",
+                    self._node.name,
+                    MEDIA_CACHE_MAX_GB,
+                )
+                return None
+            try:
+                usage = shutil.disk_usage(MEDIA_CACHE_DIR)
+                min_free = max(5 * 1024**3, usage.total // 10)
+                with os.scandir(MEDIA_CACHE_DIR) as entries:
+                    cached_bytes = sum(
+                        entry.stat(follow_symlinks=False).st_size
+                        for entry in entries
+                        if entry.name.endswith(".cache") and entry.is_file(follow_symlinks=False)
+                    )
+            except OSError as exc:
+                logger.warning("Nao foi possivel verificar espaco do cache de mídia: %s", exc)
+                return None
+            if cached_bytes + _MEDIA_CACHE_RESERVED_BYTES + expected_size > MEDIA_CACHE_MAX_BYTES:
+                logger.info(
+                    "Cache de mídia no limite de %s GB; mantendo leitura direta do Telegram.",
+                    MEDIA_CACHE_MAX_GB,
+                )
+                return None
+            if usage.free - _MEDIA_CACHE_RESERVED_BYTES - expected_size < min_free:
+                logger.info("Cache de mídia sem espaço seguro; mantendo leitura direta do Telegram.")
+                return None
+            _MEDIA_CACHE_RESERVED_BYTES += expected_size
+            _MEDIA_CACHE_LAST_ACCESS[cache_path] = time()
+            task = asyncio.create_task(self._download_media_cache(cache_path, partial_path, expected_size))
+            _MEDIA_CACHE_DOWNLOADS[cache_path] = task
+        return None
+
+    async def _download_media_cache(self, cache_path, partial_path, expected_size):
+        global _MEDIA_CACHE_RESERVED_BYTES
+        current_task = asyncio.current_task()
+        completed = False
+        try:
+            async with _MEDIA_CACHE_PREFETCH_LIMIT:
+                source = MongoDBMemoryIO(self._node, "rb", self._tg, self._db, cache_enabled=False)
+                downloaded = 0
+                async with aiofiles.open(partial_path, "wb") as output:
+                    async for chunk in source._iter_telegram_parts(1024 * 1024):
+                        await output.write(chunk)
+                        downloaded += len(chunk)
+                    await output.flush()
+                if downloaded != expected_size:
+                    raise OSError(f"cache incompleto: {downloaded}/{expected_size} bytes")
+                os.replace(partial_path, cache_path)
+                accessed_at = _MEDIA_CACHE_LAST_ACCESS.get(cache_path, time())
+                os.utime(cache_path, (accessed_at, accessed_at))
+                completed = True
+                logger.info("Cache de mídia pronto: %s (%s bytes).", self._node.name, downloaded)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Cache de mídia falhou para %s; stream segue pelo Telegram: %s",
+                self._node.name,
+                exc,
+            )
+        finally:
+            try:
+                if os.path.exists(partial_path):
+                    os.remove(partial_path)
+            except OSError:
+                pass
+            async with _MEDIA_CACHE_LOCK:
+                _MEDIA_CACHE_RESERVED_BYTES = max(0, _MEDIA_CACHE_RESERVED_BYTES - expected_size)
+                if _MEDIA_CACHE_DOWNLOADS.get(cache_path) is current_task:
+                    _MEDIA_CACHE_DOWNLOADS.pop(cache_path, None)
+                if not completed:
+                    _MEDIA_CACHE_LAST_ACCESS.pop(cache_path, None)
+
+    async def iter_by_block(self, block_size):
+        pending_cache_path = None
+        if self._node.local_path and os.path.exists(self._node.local_path):
+            async for chunk in self._iter_local_file(self._node.local_path, block_size):
+                yield chunk
             return
+
+        if self._cache_enabled and self._mode == "rb" and not _media_cache_overlaps_staging():
+            cache_path, _ = _media_cache_paths(self._node)
+            pending_cache_path = cache_path
+            if cache_path:
+                await self._register_media_cache_reader(cache_path)
+
+        try:
+            if pending_cache_path:
+                if os.path.isfile(pending_cache_path):
+                    try:
+                        if os.path.getsize(pending_cache_path) == int(self._node.size or 0):
+                            os.utime(pending_cache_path, None)
+                            async for chunk in self._iter_local_file(
+                                pending_cache_path, block_size, touch_cache=True
+                            ):
+                                yield chunk
+                            return
+                    except OSError:
+                        pass
+                await self._start_media_cache_download()
+
+            async for chunk in self._iter_telegram_parts(block_size):
+                if pending_cache_path in _MEDIA_CACHE_LAST_ACCESS:
+                    _MEDIA_CACHE_LAST_ACCESS[pending_cache_path] = time()
+                yield chunk
+        finally:
+            await self._release_media_cache_reader()
+
+    async def _iter_telegram_parts(self, block_size):
 
         if File is None:
             logger.error("Cannot stream from Telegram: pyrogram/tgcrypto not installed")
             raise OSError("Telegram streaming support is unavailable")
         parts = self._node.parts
+        source_label = "STREAM" if self._cache_enabled else "CACHE"
         if not parts:
             if self._node.size:
                 raise OSError(f"No Telegram parts are recorded for {self._node.name!r}")
@@ -405,7 +713,8 @@ class MongoDBMemoryIO:
                     remaining_candidates.remove(tg)
                     bot_number = self._tg.index(tg) + 1 if isinstance(self._tg, (list, tuple)) else 1
                     logger.info(
-                        "[STREAM] Midia=%s parte=%s tentando Bot #%s",
+                        "[%s] Midia=%s parte=%s tentando Bot #%s",
+                        source_label,
                         self._node.name,
                         part.get("part_id"),
                         bot_number,
@@ -443,15 +752,17 @@ class MongoDBMemoryIO:
                                     if file.reference_refreshed:
                                         part["tg_file"] = file.file_id
                                     logger.info(
-                                        "[STREAM] Rota salva: midia=%s parte=%s Bot #%s",
+                                        "[%s] Rota salva: midia=%s parte=%s Bot #%s",
+                                        source_label,
                                         self._node.name,
                                         part.get("part_id"),
                                         bot_number,
                                     )
                                 except Exception as exc:
-                                    logger.warning("[STREAM] Nao foi possivel salvar referencia: %s", exc)
+                                    logger.warning("[%s] Nao foi possivel salvar referencia: %s", source_label, exc)
                             logger.info(
-                                "[STREAM] Midia=%s parte=%s atendida pelo Bot #%s",
+                                "[%s] Midia=%s parte=%s atendida pelo Bot #%s",
+                                source_label,
                                 self._node.name,
                                 part.get("part_id"),
                                 bot_number,
@@ -464,7 +775,8 @@ class MongoDBMemoryIO:
                 if streamed:
                     break
                 logger.warning(
-                    "[STREAM] Midia=%s parte=%s sem dados no Bot #%s",
+                    "[%s] Midia=%s parte=%s sem dados no Bot #%s",
+                    source_label,
                     self._node.name,
                     part.get("part_id"),
                     bot_number,
@@ -712,35 +1024,56 @@ class MongoDBPathIO(AbstractPathIO):
             @universal_exception
             async def __anext__(cls):
                 if cls.iter is None:
-                    docs_by_name = {}
+                    candidates = []
                     queries = [{"parent": search}]
                     directory_node = await self.get_node(path)
                     if directory_node is not None and directory_node.id is not None:
                         queries.append({"parent": directory_node.id})
                     for query in queries:
                         async for doc in self._files.find(query):
-                            name = doc.get("name", "")
-                            key = name.casefold() if isinstance(name, str) else ""
-                            if (
-                                not key
-                                or key.endswith(".partial")
-                                or not await self._is_visible_listing_doc(search, doc)
-                            ):
-                                continue
-                            current = docs_by_name.get(key)
-                            if current is None:
+                            candidates.append(doc)
+
+                    async def visible_candidate(doc):
+                        name = doc.get("name", "")
+                        if not name or name.casefold().endswith(".partial"):
+                            return doc, False
+                        return doc, await self._is_visible_listing_doc(search, doc)
+
+                    # Directory visibility may require a MongoDB descendant
+                    # query. Run those checks concurrently but bounded, rather
+                    # than serially issuing one round trip per directory.
+                    visibility_limit = Semaphore(8)
+
+                    async def bounded_visibility(doc):
+                        async with visibility_limit:
+                            return await visible_candidate(doc)
+
+                    visible_candidates = []
+                    for offset in range(0, len(candidates), 32):
+                        batch = candidates[offset:offset + 32]
+                        visible_candidates.extend(
+                    await gather(*(bounded_visibility(doc) for doc in batch))
+                        )
+
+                    docs_by_name = {}
+                    for doc, is_visible in visible_candidates:
+                        if not is_visible:
+                            continue
+                        key = doc["name"].casefold()
+                        current = docs_by_name.get(key)
+                        if current is None:
+                            docs_by_name[key] = doc
+                        else:
+                            candidate_score = (
+                                2 * int(doc.get("status") == "completed" and self._has_telegram_payload(doc))
+                                + int(self._is_directory_doc(doc))
+                            )
+                            current_score = (
+                                2 * int(current.get("status") == "completed" and self._has_telegram_payload(current))
+                                + int(self._is_directory_doc(current))
+                            )
+                            if candidate_score > current_score:
                                 docs_by_name[key] = doc
-                            else:
-                                candidate_score = (
-                                    2 * int(doc.get("status") == "completed" and self._has_telegram_payload(doc))
-                                    + int(self._is_directory_doc(doc))
-                                )
-                                current_score = (
-                                    2 * int(current.get("status") == "completed" and self._has_telegram_payload(current))
-                                    + int(self._is_directory_doc(current))
-                                )
-                                if candidate_score > current_score:
-                                    docs_by_name[key] = doc
                     visible = []
                     for doc in docs_by_name.values():
                         name = doc.get("name", "")
