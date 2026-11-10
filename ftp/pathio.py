@@ -357,7 +357,10 @@ class BoundedLRUCache(OrderedDict):
 
     def __getitem__(self, key):
         value = super().__getitem__(key)
-        self.move_to_end(key)
+        try:
+            self.move_to_end(key)
+        except KeyError:
+            pass
         return value
 
     def get(self, key, default=None):

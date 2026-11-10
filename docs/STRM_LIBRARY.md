@@ -47,3 +47,58 @@ O resumo informa arquivos gerados, links atualizados, mídias preservadas ou
 renomeadas, links inválidos examinados e conflitos. A função opcional de limpeza
 de STRMs obsoletos continua separada da execução padrão do botão e pode remover
 arquivos inválidos ou obsoletos que não estejam associados a mídias concluídas.
+
+## Reclassificações confirmadas — 2026-10-21
+
+O campo `parent` do documento de mídia no MongoDB é a fonte da categoria usada
+na próxima geração da biblioteca. Quando o operador confirma uma categoria
+incorreta, corrija o `parent` antes de regenerar os STRMs; mover apenas o arquivo
+local não é persistente.
+
+- **Prisma**: dois documentos concluídos foram movidos de
+  `/raphael/Animações/Prisma/Season 01` para
+  `/raphael/Series/Prisma/Season 01`. Estados, tamanhos e partes Telegram foram
+  preservados. O STRM existente foi movido para `Series` sem alteração do
+  conteúdo; os dez arquivos da pasta mantiveram os hashes.
+- **Y - O Último Homem**: dez documentos concluídos tiveram somente o `parent`
+  alterado de `Animações` para `Series`, conforme confirmação do usuário e NFO
+  local (`Drama`, `Sci-Fi & Fantasy`). Os STRMs já estavam em `Series`.
+- **Hell's Paradise**: os 25 documentos concluídos já apontavam para
+  `Animações`; nenhum documento ou STRM foi alterado. A cópia sob `Series` não
+  contém STRM e tem dois NFOs divergentes, portanto seus sidecars foram mantidos
+  sem sobrescrita ou exclusão.
+- Auditoria pós-correção de `strm_library`: 26.948 STRMs; todos resolveram para
+  documentos Mongo `completed`, sem IDs repetidos, links inválidos ou diferença
+  entre categoria física e `parent`.
+- Backups mínimos dos `parent` anteriores estão em
+  `backups/mongo_prisma_parent_20261021.jsonl.gz` e
+  `backups/mongo_y_ultimo_homem_parent_20261021.jsonl.gz`. Nenhum documento ou
+  arquivo duplicado foi excluído na correção de Prisma, Y - O Último Homem e
+  Hell's Paradise. `D:\midias` não foi alterada naquela operação; a alteração
+  posterior está descrita abaixo.
+
+### All of Us Are Dead e Solteiros, Ilhados e Desesperados — 2026-10-21
+
+- O usuário confirmou os dois títulos como séries. Um documento Mongo
+  `completed` de cada título teve somente a categoria de `parent` alterada de
+  `Doramas` para `Series`; IDs, `status`, `parts` e `size` foram preservados.
+- As árvores completas de `strm_library/Doramas/<título>` foram movidas para
+  `strm_library/Series/<título>`, mantendo STRM e sidecars. O ID de cada STRM
+  foi conferido contra o `_id` Mongo correspondente.
+- Em `D:\midias`, havia 11 links de All of Us Are Dead e 52 de Solteiros,
+  Ilhados e Desesperados duplicados entre as categorias. Todos tinham mesmos
+  caminhos relativos e bytes; os duplicados em `Doramas` foram removidos e as
+  cópias idênticas de `Series` foram preservadas. Nenhum arquivo não-STRM
+  existia nessas árvores de origem.
+- Pós-validação: os dois documentos continuam `completed` em `Series`, os dois
+  STRMs da biblioteca gerada resolvem para seus IDs Mongo, há 11 e 52 links em
+  `D:\midias/Series`, e não restam árvores desses títulos em `Doramas` nos dois
+  locais.
+- Os links de `D:\midias` são entradas distintas de provedor. A busca local não
+  encontrou ali os episódios correspondentes aos documentos Mongo
+  (`All of Us Are Dead - S01E03` e `Solteiros, Ilhados e Desesperados - S01E01`);
+  eles existem em `strm_library/Series`. Nenhum link novo foi criado em
+  `D:\midias`, para não substituir sua origem de reprodução sem instrução.
+- Backup mínimo dos dois `parent` anteriores:
+  `../backups/mongo_series_category_parent_20261021.jsonl.gz`. O esquema do
+  MongoDB permaneceu igual.

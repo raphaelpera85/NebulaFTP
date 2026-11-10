@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import filecmp
 import json
 import logging
 import mimetypes
@@ -22,7 +23,9 @@ import queue
 import re
 import shutil
 import socket
+import ssl
 import sys
+import tempfile
 import threading
 import time
 import unicodedata
@@ -38,6 +41,32 @@ from bson import ObjectId
 from dotenv import load_dotenv
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError, PyMongoError
+
+# --- RESILIÊNCIA DE REDE / DNS / SSL ---
+# Evita DNS hijacking / sinkholing IPv6 praticado por operadoras/roteadores em domínios de
+# streaming/CDN (que causam [SSL: TLSV1_UNRECOGNIZED_NAME]) forçando preferência por IPv4.
+_ORIGINAL_GETADDRINFO = socket.getaddrinfo
+
+
+def _ipv4_preferred_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    if family == 0:
+        try:
+            return _ORIGINAL_GETADDRINFO(host, port, socket.AF_INET, type, proto, flags)
+        except socket.gaierror:
+            pass
+    return _ORIGINAL_GETADDRINFO(host, port, family, type, proto, flags)
+
+
+socket.getaddrinfo = _ipv4_preferred_getaddrinfo
+
+# Contexto SSL permissivo para CDNs / streamings com certificados SNI flexíveis
+try:
+    _ssl_ctx = ssl.create_default_context()
+    _ssl_ctx.check_hostname = False
+    _ssl_ctx.verify_mode = ssl.CERT_NONE
+    ssl._create_default_https_context = lambda: _ssl_ctx
+except Exception:
+    pass
 
 # Carregar variáveis de ambiente
 load_dotenv()
@@ -68,6 +97,20 @@ def is_incomplete_filename(name: str) -> bool:
 
 # Prioridade de categorias do Nebula: Animações > Filmes > Séries > Doramas > Novelas > Porno (A–Z)
 CATEGORY_PRIORITY = ["animacoes", "filmes", "series", "doramas", "novelas", "porno"]
+CATEGORY_ALIASES = {
+    "anime": "animacoes",
+    "animes": "animacoes",
+    "animacao": "animacoes",
+    "animacoes": "animacoes",
+    "dorama": "doramas",
+    "doramas": "doramas",
+    "filme": "filmes",
+    "filmes": "filmes",
+    "novela": "novelas",
+    "novelas": "novelas",
+    "porno": "porno",
+    "series": "series",
+}
 
 logger = logging.getLogger("STRMDownloader")
 
@@ -129,6 +172,37 @@ def normalize_media_title(value: str) -> str:
     return " ".join(re.findall(r"[a-z0-9]+", ascii_value.casefold()))
 
 
+def load_m3u_priority_config() -> dict[str, list[str]]:
+    """Lê prioridades da GUI sem depender de Mongo ou de estado em memória."""
+    configured = os.getenv("NEBULA_M3U_PRIORITY_FILE")
+    path = Path(configured) if configured else Path(__file__).resolve().parent.parent / "m3u_priority.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"paths": [], "terms": []}
+    if not isinstance(value, dict):
+        return {"paths": [], "terms": []}
+    return {
+        "paths": [str(item) for item in value.get("paths", [])],
+        "terms": [str(item) for item in value.get("terms", [])],
+    }
+
+
+def is_priority_item(source_root: Path, media_path: Path, config: dict[str, list[str]] | None = None) -> bool:
+    """Confere caminho relativo e título para priorizar download e upload."""
+    config = config or load_m3u_priority_config()
+    try:
+        relative = media_path.relative_to(source_root).as_posix()
+    except ValueError:
+        relative = media_path.name
+    relative_key = normalize_media_title(relative)
+    path_keys = {normalize_media_title(item) for item in config.get("paths", [])}
+    if relative_key in path_keys:
+        return True
+    haystack = normalize_media_title(f"{relative} {media_path.stem}")
+    return any(normalize_media_title(term) and normalize_media_title(term) in haystack for term in config.get("terms", []))
+
+
 def movie_identity(value: str) -> tuple[str, str] | None:
     """Retorna a tupla (titulo_normalizado, ano) para filmes."""
     years = list(re.finditer(r"(?<!\d)((?:19|20)\d{2})(?!\d)", value))
@@ -152,6 +226,19 @@ def episode_identity(series_name: str, filename: str) -> tuple[str, int, int] | 
     if not title:
         return None
     return title, int(match.group("season")), int(match.group("episode"))
+
+
+def category_dir_priority(dirname: str) -> int:
+    norm = unicodedata.normalize("NFKD", dirname).encode("ascii", "ignore").decode().lower()
+    for idx, cat in enumerate(CATEGORY_PRIORITY):
+        if cat in norm or (cat == "animacoes" and any(k in norm for k in ["animac", "anime"])) \
+           or (cat == "filmes" and any(k in norm for k in ["filme", "movie"])) \
+           or (cat == "doramas" and any(k in norm for k in ["dorama", "kdrama", "k-drama"])) \
+           or (cat == "novelas" and any(k in norm for k in ["novela", "soap"])) \
+           or (cat == "porno" and any(k in norm for k in ["porno", "porn", "xxx", "hentai", "adulto"])) \
+           or (cat == "series" and any(k in norm for k in ["serie", "season", "tv"])):
+            return idx
+    return len(CATEGORY_PRIORITY)
 
 
 def get_category_from_path(src: Path, source_root: Path) -> str:
@@ -188,6 +275,85 @@ def get_category_from_path(src: Path, source_root: Path) -> str:
     if any(k in src_str for k in ["\\series\\", "/series/", "serie", "season"]) or "\\tv\\" in src_str or "/tv/" in src_str:
         return "series"
     return "other"
+
+
+def normalize_category_name(value: str) -> str | None:
+    """Return a known library category, ignoring accents and case."""
+    normalized = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode().casefold()
+    return CATEGORY_ALIASES.get(normalized)
+
+
+def relocate_strm_to_mongo_parent(
+    strm_path: Path,
+    source_root: Path,
+    mongo_parent: str,
+    library_user: str = "raphael",
+    *,
+    dry_run: bool = False,
+) -> Path | None:
+    """Move a category-misfiled STRM to its Mongo parent without overwriting files."""
+    if strm_path.suffix.casefold() != ".strm" or strm_path.is_symlink():
+        return strm_path
+
+    root = source_root.resolve()
+    try:
+        source = strm_path.resolve(strict=True)
+        relative_parts = source.relative_to(root).parts
+    except (OSError, ValueError):
+        logger.warning("STRM fora da raiz monitorada ou inacessível; preservado: %s", strm_path)
+        return None
+
+    parent_parts = [part for part in mongo_parent.replace("\\", "/").split("/") if part]
+    if parent_parts and parent_parts[0].casefold() == library_user.strip("/").casefold():
+        parent_parts = parent_parts[1:]
+    if not parent_parts or any(part in {".", ".."} for part in parent_parts):
+        return strm_path
+
+    source_category = normalize_category_name(relative_parts[0]) if relative_parts else None
+    target_category = normalize_category_name(parent_parts[0])
+    if not source_category or not target_category or source_category == target_category:
+        return strm_path
+
+    target = root.joinpath(*parent_parts, strm_path.name)
+    try:
+        target.resolve().relative_to(root)
+    except ValueError:
+        logger.warning("Destino Mongo fora da raiz monitorada; STRM preservado: %s", strm_path)
+        return None
+
+    if target.exists():
+        logger.warning(
+            "Conflito de categoria: destino já existe; ambos STRMs foram preservados: %s -> %s",
+            strm_path,
+            target,
+        )
+        return None
+    if dry_run:
+        logger.info("[DRY-RUN] STRM seria reclassificado: %s -> %s", strm_path, target)
+        return target
+
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # Hard-link creation is atomic and fails if the destination exists.
+        # Both paths stay on the monitored library; unlink only after linking succeeds.
+        os.link(source, target)
+        source.unlink()
+    except FileExistsError:
+        logger.warning(
+            "Conflito de categoria durante movimentação; STRM preservado: %s -> %s",
+            strm_path,
+            target,
+        )
+        return None
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            if target.exists() and os.path.samefile(source, target):
+                target.unlink()
+        logger.warning("Falha ao reclassificar STRM; original preservado: %s (%s)", strm_path, exc)
+        return None
+
+    logger.info("STRM reclassificado conforme Mongo: %s -> %s", strm_path, target)
+    return target
 
 
 def read_strm_url(src: Path) -> str:
@@ -373,30 +539,182 @@ def wait_for_disk_capacity(
     required_bytes: int | None,
     min_free_percent: int = 10,
     poll_seconds: int = 10,
-) -> None:
-    """Bloqueia a execução até que haja espaço suficiente em disco."""
-    target_path.parent.mkdir(parents=True, exist_ok=True)
+    staging_dirs: list[Path] | None = None,
+) -> Path:
+    """Escolhe um Stage com espaço e preserva parciais ao trocar de volume."""
+    target_path = Path(target_path)
+    roots = [Path(root).resolve() for root in (staging_dirs or [target_path.parent])]
+    relative_target = None
+    current_root = None
+    for root in roots:
+        try:
+            relative_target = target_path.resolve().relative_to(root)
+            current_root = root
+            break
+        except ValueError:
+            continue
+    if relative_target is None:
+        roots = [target_path.parent.resolve()]
+        relative_target = Path(target_path.name)
+        current_root = roots[0]
+
+    min_free_percent = min(max(min_free_percent, 1), 90)
+    roots = [current_root, *(root for root in roots if root != current_root)]
     last_log = 0.0
     while True:
-        try:
-            usage = shutil.disk_usage(target_path.parent)
-            reserve = usage.total * min_free_percent // 100
-            if usage.free - (required_bytes or 0) >= reserve:
-                return
-            now = time.time()
-            if now - last_log >= 30:
-                logger.warning(
-                    "Disco aguardando liberação de espaço em %s: Livre=%.1f GB (Reserva=%d%%, Necessário=%.1f GB)",
-                    target_path.parent,
-                    usage.free / 1024**3,
-                    min_free_percent,
-                    (required_bytes or 0) / 1024**3,
-                )
-                last_log = now
-        except Exception as exc:
-            logger.debug("Erro ao checar espaço em disco: %s", exc)
-            return
+        for root in roots:
+            candidate = root / relative_target
+            try:
+                probe = candidate.parent
+                while not probe.exists() and probe.parent != probe:
+                    probe = probe.parent
+                usage = shutil.disk_usage(probe)
+                reserve = usage.total * min_free_percent // 100
+                if usage.free - (required_bytes or 0) < reserve:
+                    continue
+                if candidate.resolve() != target_path.resolve():
+                    logger.info(
+                        "Stage %s com capacidade insuficiente (livre: %.1f GB, reserva %d%%). Transferindo parciais para %s...",
+                        target_path.parent,
+                        usage.free / 1024**3,
+                        min_free_percent,
+                        candidate.parent,
+                    )
+                    if not relocate_staging_partials(target_path, candidate):
+                        logger.warning("Não foi possível transferir parciais para o Stage alternativo: %s", candidate.parent)
+                        continue
+                    logger.info("Stage sem capacidade suficiente; retomando parciais em: %s", candidate.parent)
+                candidate.parent.mkdir(parents=True, exist_ok=True)
+                return candidate
+            except Exception as exc:
+                logger.debug("Erro ao verificar Stage %s: %s", candidate.parent, exc)
+
+        now = time.time()
+        if now - last_log >= 30:
+            logger.warning(
+                "Discos de Stage aguardando espaço (%s): necessário=%.1f GB, reserva=%d%%",
+                ", ".join(str(root) for root in roots),
+                (required_bytes or 0) / 1024**3,
+                min_free_percent,
+            )
+            last_log = now
         time.sleep(poll_seconds)
+
+
+def relocate_staging_partials(source_target: Path, destination_target: Path) -> bool:
+    """Copia parciais para outro Stage, mantendo os originais até conclusão."""
+    source_parent = Path(source_target).parent
+    stem = Path(source_target).stem
+    partials = sorted({
+        path
+        for pattern in (f".{stem}.download*", f".{stem}.*.download*")
+        for path in source_parent.glob(pattern)
+    })
+    if any(path.is_symlink() or not path.is_file() for path in partials):
+        return False
+    if not partials:
+        return True
+
+    destination_parent = Path(destination_target).parent
+    destination_parent.mkdir(parents=True, exist_ok=True)
+
+    # Limpar arquivos temporários de migrações anteriores
+    for leftover in destination_parent.glob(".nebula-stage-migration-*"):
+        with contextlib.suppress(OSError):
+            leftover.unlink()
+
+    pairs = [(source, destination_parent / source.name) for source in partials]
+    logger.info("Migrando %d arquivos de partes para %s...", len(partials), destination_parent)
+
+    created: list[Path] = []
+    temporary: list[Path] = []
+    source_stats = {}
+    try:
+        for source, destination in pairs:
+            source_stat = source.stat()
+            source_stats[source] = source_stat
+
+            if destination.exists():
+                if destination.is_symlink() or not destination.is_file():
+                    destination.unlink(missing_ok=True)
+                elif destination.stat().st_size == source_stat.st_size:
+                    # Já existe com tamanho exato, reutiliza sem gastar I/O
+                    continue
+                else:
+                    logger.warning("Parcial conflitante preservada: %s", destination)
+                    return False
+
+            fd, temporary_name = tempfile.mkstemp(prefix=".nebula-stage-migration-", dir=destination_parent)
+            os.close(fd)
+            temp_path = Path(temporary_name)
+            temporary.append(temp_path)
+            shutil.copy2(source, temp_path)
+            current_source_stat = source.stat()
+            if (
+                temp_path.stat().st_size != source_stat.st_size
+                or current_source_stat.st_size != source_stat.st_size
+                or current_source_stat.st_mtime_ns != source_stat.st_mtime_ns
+            ):
+                raise OSError(f"Cópia parcial incompleta: {source.name}")
+            try:
+                if destination.exists():
+                    if destination.is_symlink() or not destination.is_file():
+                        destination.unlink(missing_ok=True)
+                    elif destination.stat().st_size != source_stat.st_size:
+                        temp_path.unlink(missing_ok=True)
+                        temporary.remove(temp_path)
+                        logger.warning("Parcial conflitante preservada: %s", destination)
+                        return False
+                    else:
+                        temp_path.unlink(missing_ok=True)
+                        temporary.remove(temp_path)
+                        continue
+                os.link(temp_path, destination)
+            except OSError:
+                temp_path.replace(destination)
+            else:
+                temp_path.unlink(missing_ok=True)
+            temporary.remove(temp_path)
+            created.append(destination)
+    except Exception as exc:
+        for path in temporary + created:
+            with contextlib.suppress(OSError):
+                path.unlink()
+        logger.warning("Falha ao copiar parciais para Stage alternativo: %s", exc)
+        return False
+
+    logger.info("Migração de parciais concluída com sucesso para %s.", destination_parent)
+    return True
+
+
+def cleanup_staging_partials(target_path: Path, staging_dirs: list[Path] | None = None) -> None:
+    """Remove parciais dos Stages só depois de existir arquivo final validado."""
+    target_path = Path(target_path)
+    roots = [Path(root).resolve() for root in (staging_dirs or [target_path.parent])]
+    relative_target = None
+    for root in roots:
+        try:
+            relative_target = target_path.resolve().relative_to(root)
+            break
+        except ValueError:
+            continue
+    if relative_target is None:
+        roots = [target_path.parent.resolve()]
+        relative_target = Path(target_path.name)
+
+    for root in roots:
+        parent = (root / relative_target).parent
+        if not parent.is_dir():
+            continue
+        stem = Path(relative_target).stem
+        partials = {
+            path
+            for pattern in (f".{stem}.download*", f".{stem}.*.download*")
+            for path in parent.glob(pattern)
+        }
+        for path in partials:
+            with contextlib.suppress(OSError):
+                path.unlink()
 
 
 def find_existing_staging_target(
@@ -407,6 +725,7 @@ def find_existing_staging_target(
     """
     Verifica se a mídia ou suas partes já existem em algum dos diretórios de stage configurados.
     Retorna (target_stage_file, has_existing_data).
+    Prioriza estágios com maior espaço livre quando múltiplos contiverem partes da mídia.
     """
     try:
         rel_dest = destination.resolve().relative_to(dest_root.resolve())
@@ -414,6 +733,7 @@ def find_existing_staging_target(
         rel_dest = Path(destination.name)
 
     stem = destination.stem
+    candidates_with_data = []
 
     for stage_dir in staging_dirs:
         target_cand = stage_dir / rel_dest
@@ -425,19 +745,28 @@ def find_existing_staging_target(
         if target_cand.exists() and target_cand.stat().st_size > 0:
             return target_cand, True
 
-        # 2. Se o arquivo temporário concatenado ou partes parciais existem
+        has_data = False
         tmp_base = parent_cand / f".{stem}.download"
         if tmp_base.exists() and tmp_base.stat().st_size > 0:
-            return target_cand, True
+            has_data = True
 
-        # 3. Se existem arquivos .part ou .tmp dessa mídia
-        try:
-            if any(parent_cand.glob(f".{stem}.download*")):
-                return target_cand, True
-            if any(parent_cand.glob(f".{stem}.*.download*")):
-                return target_cand, True
-        except Exception:
-            pass
+        if not has_data:
+            try:
+                if any(parent_cand.glob(f".{stem}.download*")) or any(parent_cand.glob(f".{stem}.*.download*")):
+                    has_data = True
+            except Exception:
+                pass
+
+        if has_data:
+            try:
+                free_space = shutil.disk_usage(stage_dir).free
+            except Exception:
+                free_space = 0
+            candidates_with_data.append((free_space, target_cand))
+
+    if candidates_with_data:
+        candidates_with_data.sort(key=lambda x: x[0], reverse=True)
+        return candidates_with_data[0][1], True
 
     return None, False
 
@@ -548,6 +877,14 @@ class FailureTracker:
             try:
                 with self.cache_file.open("r", encoding="utf-8") as f:
                     self.failures = json.load(f)
+                # Purga automática de erros de SSL/TLS antigos que foram sanados pelo patch de IPv4/SSL
+                cleaned = {
+                    k: v for k, v in self.failures.items()
+                    if not any(token in v.get("error", "").lower() for token in ("ssl", "tlsv1", "unrecognized_name"))
+                }
+                if len(cleaned) != len(self.failures):
+                    self.failures = cleaned
+                    self._save()
             except Exception as exc:
                 logger.debug("Falha ao carregar tracker de falhas: %s", exc)
                 self.failures = {}
@@ -612,7 +949,8 @@ class FailureTracker:
             self._save()
 
             # Circuit breaker por série para erros fatais de servidor remoto
-            is_fatal = any(code in str(error) for code in ("401", "403", "404", "406", "410"))
+            # 406 can reject one URL without indicating that sibling episodes are unavailable.
+            is_fatal = any(code in str(error) for code in ("401", "403", "404", "410"))
             if is_fatal:
                 series_k = get_series_key(file_path)
                 streak = self.series_streak.get(series_k, 0) + 1
@@ -649,6 +987,56 @@ class FailureTracker:
 # VALIDAÇÃO CONTRA MONGODB (MÍDIAS CONCLUÍDAS OU ATIVAS)
 # =====================================================================
 
+def extract_stream_file_id(url: str | None) -> str | None:
+    """Return a Mongo media ID embedded in a Nebula stream URL, if present."""
+    if not url:
+        return None
+    try:
+        parsed = urlsplit(url)
+        params = parse_qs(parsed.query)
+        for key in ("id", "file_id", "media_id"):
+            value = params.get(key, [None])[0]
+            if value:
+                return str(value)
+        match = re.search(r"/([a-fA-F0-9]{24}|\d+)\.(?:mkv|mp4|avi|ts)$", parsed.path)
+        return match.group(1) if match else None
+    except Exception:
+        return None
+
+
+def is_object_id_parent(parent: object) -> bool:
+    """True quando o ``parent`` é um ObjectId (ou sua forma hexadecimal), não um caminho."""
+    if isinstance(parent, str):
+        return bool(re.fullmatch(r"[a-fA-F0-9]{24}", parent))
+    return parent is not None and type(parent).__name__ == "ObjectId"
+
+
+def resolve_directory_path(files, parent: object, memo: dict[str, str], _depth: int = 0) -> str:
+    """Reconstrói o caminho virtual de um diretório cujo ``parent`` é ObjectId."""
+    key = str(parent)
+    if key in memo:
+        return memo[key]
+    path = ""
+    if _depth < 64:
+        try:
+            node = files.find_one(
+                {"_id": ObjectId(parent) if isinstance(parent, str) else parent},
+                {"name": 1, "parent": 1},
+            )
+        except Exception:
+            node = None
+        if node:
+            up = node.get("parent", "")
+            base = (
+                resolve_directory_path(files, up, memo, _depth + 1)
+                if is_object_id_parent(up)
+                else str(up)
+            )
+            path = f"{base.rstrip('/')}/{node.get('name', '')}"
+    memo[key] = path
+    return path
+
+
 class MediaValidator:
     """Validador central de mídias concluídas ou ativas no MongoDB."""
 
@@ -661,6 +1049,10 @@ class MediaValidator:
         self.exact_completed: set[tuple[str, str]] = set()
         self.stem_completed: set[tuple[str, str]] = set()
         self.active_paths_or_names: set[str] = set()
+        self.recovery_ids: set[str] = set()
+        self.recovery_targets: set[tuple[str, str]] = set()
+        self.recovery_records: list[tuple[str, str, str]] = []
+        self.last_parent_lookup_available = True
         self.last_cache_time = 0.0
 
     def refresh_cache(self, force: bool = False) -> None:
@@ -681,21 +1073,48 @@ class MediaValidator:
             movies: set[tuple[str, str]] = set()
             episodes: set[tuple[str, int, int]] = set()
             active: set[str] = set()
+            recovery_ids: set[str] = set()
+            recovery_targets: set[tuple[str, str]] = set()
+            recovery_records: list[tuple[str, str, str]] = []
+            dir_path_memo: dict[str, str] = {}
 
             for doc in db.files.find(
                 {"type": "file"},
-                {"parent": 1, "name": 1, "status": 1, "local_path": 1},
+                {
+                    "parent": 1,
+                    "name": 1,
+                    "status": 1,
+                    "local_path": 1,
+                    "recovery_required": 1,
+                    "failed_reason": 1,
+                },
             ):
-                parent = str(doc.get("parent", "")).casefold()
+                parent_raw = doc.get("parent", "")
                 name = str(doc.get("name", ""))
                 status = doc.get("status")
                 local_path = doc.get("local_path")
+                is_recovery = (
+                    status in ACTIVE_STATUSES
+                    and doc.get("recovery_required") is True
+                    and doc.get("failed_reason") == "local_path_missing"
+                )
+                if is_recovery and is_object_id_parent(parent_raw):
+                    # Pai armazenado como ObjectId: reconstrói o caminho virtual.
+                    parent_raw = resolve_directory_path(db.files, parent_raw, dir_path_memo)
+                parent = str(parent_raw).casefold()
 
                 if not name:
                     continue
 
                 name_lower = name.casefold()
                 stem_lower = Path(name).stem.casefold()
+
+                if is_recovery:
+                    recovery_ids.add(str(doc.get("_id", "")))
+                    recovery_targets.add((parent, name_lower))
+                    recovery_targets.add((parent, stem_lower))
+                    recovery_records.append((parent, name, str(doc.get("_id", ""))))
+                    continue
 
                 if status == "completed":
                     exact_set.add((parent, name_lower))
@@ -728,6 +1147,9 @@ class MediaValidator:
             self.completed_movies = movies
             self.completed_episodes = episodes
             self.active_paths_or_names = active
+            self.recovery_ids = recovery_ids
+            self.recovery_targets = recovery_targets
+            self.recovery_records = recovery_records
             self.last_cache_time = now
             client.close()
             logger.debug(
@@ -736,6 +1158,171 @@ class MediaValidator:
             )
         except Exception as exc:
             logger.warning("Falha ao atualizar índice Mongo: %s", exc)
+
+    def canonical_parent_for_stream(self, url: str) -> str | None:
+        """Fetch the current persisted parent for a completed or recovery stream ID."""
+        file_id = extract_stream_file_id(url)
+        if not file_id or not self.mongo_uri or "mongodb://test" in self.mongo_uri:
+            self.last_parent_lookup_available = False
+            return None
+
+        client = None
+        try:
+            client = MongoClient(self.mongo_uri, serverSelectionTimeoutMS=3000)
+            files = client[self.db_name].files
+            eligible_status = {
+                "$or": [
+                    {"status": "completed"},
+                    {
+                        "status": {"$in": list(ACTIVE_STATUSES)},
+                        "recovery_required": True,
+                        "failed_reason": "local_path_missing",
+                    },
+                ]
+            }
+            candidates: list[Any] = []
+            with contextlib.suppress(Exception):
+                candidates.append(ObjectId(file_id))
+            candidates.append(file_id)
+            for candidate_id in candidates:
+                doc = files.find_one(
+                    {"_id": candidate_id, "type": "file", **eligible_status},
+                    {"parent": 1},
+                )
+                if doc:
+                    self.last_parent_lookup_available = True
+                    return str(doc.get("parent", "")) or None
+            self.last_parent_lookup_available = True
+            return None
+        except Exception as exc:
+            self.last_parent_lookup_available = False
+            logger.warning("Consulta do parent Mongo falhou; categoria do STRM não será alterada: %s", exc)
+            return None
+        finally:
+            if client is not None:
+                client.close()
+
+    def is_recovery_candidate(
+        self,
+        strm_path: Path,
+        url: str | None = None,
+        destination: Path | None = None,
+        dest_root: Path | None = None,
+    ) -> bool:
+        """Match a STRM to an active Mongo record whose local source is missing."""
+        self.refresh_cache()
+        file_id = extract_stream_file_id(url) if url else None
+        if file_id and file_id in self.recovery_ids:
+            return True
+
+        if destination and dest_root:
+            parent = mongo_parent_for(dest_root, destination.parent, self.library_user).casefold()
+            if (parent, destination.name.casefold()) in self.recovery_targets:
+                return True
+            if (parent, destination.stem.casefold()) in self.recovery_targets:
+                return True
+        return False
+
+    def find_recovery_strm_items(
+        self,
+        sources: list[Path],
+        dest_root: Path,
+    ) -> list[tuple[Path, Path, str, int]]:
+        """Locate recovery STRMs directly from their persisted Mongo destinations."""
+        self.refresh_cache()
+        found: list[tuple[Path, Path, str, int]] = []
+        seen: set[str] = set()
+        unresolved: list[tuple[str, str, str]] = []
+        for parent, name, file_id in self.recovery_records:
+            parent_parts = [part for part in parent.split("/") if part]
+            if parent_parts and parent_parts[0].casefold() == self.library_user.casefold():
+                parent_parts = parent_parts[1:]
+            if not parent_parts:
+                continue
+
+            strm_name = f"{Path(name).stem}.strm"
+            found_direct = False
+            for source in sources:
+                candidate = source.joinpath(*parent_parts, strm_name)
+                try:
+                    resolved = str(candidate.resolve()).casefold()
+                    if resolved in seen or not candidate.is_file():
+                        continue
+                    try:
+                        linked_id = extract_stream_file_id(read_strm_url(candidate))
+                    except (OSError, UnicodeError, ValueError):
+                        continue
+                    # Só links do próprio Nebula carregam um ObjectId Mongo; IDs numéricos
+                    # de provedores externos (IPTV) não são comparáveis ao registro.
+                    if (
+                        linked_id
+                        and file_id
+                        and re.fullmatch(r"[a-fA-F0-9]{24}", linked_id)
+                        and linked_id.casefold() != file_id.casefold()
+                    ):
+                        logger.warning(
+                            "STRM de recuperação ignorado: ID do link não corresponde ao registro Mongo (%s)",
+                            candidate,
+                        )
+                        continue
+                    media_destination = destination_for(
+                        source,
+                        dest_root,
+                        candidate.with_suffix(Path(name).suffix or ".mkv"),
+                    )
+                    if not self.is_recovery_candidate(
+                        candidate,
+                        destination=media_destination,
+                        dest_root=dest_root,
+                    ):
+                        continue
+                except OSError:
+                    continue
+
+                seen.add(resolved)
+                found.append((
+                    source,
+                    candidate,
+                    get_category_from_path(candidate, source),
+                    extract_media_year(candidate.name, candidate.parent.name),
+                ))
+                found_direct = True
+                break
+            if not found_direct:
+                unresolved.append((parent, name, file_id))
+
+        misplaced: dict[str, tuple[Path, Path]] = {}
+        unresolved_ids = {file_id.casefold() for _, _, file_id in unresolved if file_id}
+        if unresolved_ids:
+            for source in sources:
+                for root, _, filenames in os.walk(source):
+                    for filename in filenames:
+                        if Path(filename).suffix.casefold() != ".strm":
+                            continue
+                        candidate = Path(root) / filename
+                        try:
+                            stream_id = extract_stream_file_id(read_strm_url(candidate))
+                        except (OSError, UnicodeError, ValueError):
+                            continue
+                        if stream_id and stream_id.casefold() in unresolved_ids:
+                            misplaced.setdefault(stream_id.casefold(), (source, candidate))
+
+        for parent, name, file_id in unresolved:
+            match = misplaced.get(file_id.casefold())
+            if not match:
+                continue
+            source, candidate = match
+            seen_key = str(candidate.resolve()).casefold()
+            if seen_key in seen:
+                continue
+            seen.add(seen_key)
+            found.append((
+                source,
+                candidate,
+                get_category_from_path(candidate, source),
+                extract_media_year(name, candidate.parent.name),
+            ))
+        return sort_strm_batch(found)
 
     def is_already_completed_or_active(
         self,
@@ -750,16 +1337,13 @@ class MediaValidator:
         """
         self.refresh_cache()
 
+        if self.is_recovery_candidate(strm_path, url, destination, dest_root):
+            return False, "STRM prioritário: registro Mongo requer recuperação do arquivo local"
+
         # 1. Verificação por ID contido na URL do stream
         if url:
             try:
-                parsed = urlsplit(url)
-                params = parse_qs(parsed.query)
-                file_id_str = params.get("id", [None])[0]
-                if not file_id_str:
-                    match_url_id = re.search(r"/(\d+)\.(?:mkv|mp4|avi|ts)$", parsed.path)
-                    if match_url_id:
-                        file_id_str = match_url_id.group(1)
+                file_id_str = extract_stream_file_id(url)
 
                 if file_id_str and self.mongo_uri and "mongodb://test" not in self.mongo_uri:
                     client = MongoClient(self.mongo_uri, serverSelectionTimeoutMS=2000)
@@ -820,6 +1404,7 @@ def download_strm_multipart(
     read_timeout: int = 20,
     max_retries: int = 4,
     min_free_percent: int = 10,
+    staging_dirs: list[Path] | None = None,
 ) -> Path:
     """
     Realiza o download de uma URL com suporte a Range requests em múltiplas partes,
@@ -853,6 +1438,7 @@ def download_strm_multipart(
                 # Checar se já existe no destino completo
                 if target_path.exists():
                     if target_path.stat().st_size == total:
+                        cleanup_staging_partials(target_path, staging_dirs)
                         return target_path
                     logger.warning(
                         "Arquivo de destino com tamanho divergente (%d != %d). Reiniciando: %s",
@@ -864,13 +1450,17 @@ def download_strm_multipart(
                 if tmp_path.exists() and tmp_path.stat().st_size == total:
                     logger.info("Arquivo unido já existente completo (%d bytes): %s", total, target_path.name)
                     tmp_path.replace(target_path)
-                    meta_path.unlink(missing_ok=True)
-                    for leftover in target_path.parent.glob(f".{target_path.stem}.*.download*"):
-                        with contextlib.suppress(Exception):
-                            leftover.unlink(missing_ok=True)
+                    cleanup_staging_partials(target_path, staging_dirs)
                     return target_path
 
-                wait_for_disk_capacity(target_path, total, min_free_percent)
+                target_path = wait_for_disk_capacity(
+                    target_path,
+                    total,
+                    min_free_percent,
+                    staging_dirs=staging_dirs,
+                ) or target_path
+                tmp_path = target_path.parent / f".{target_path.stem}.download"
+                meta_path = Path(f"{tmp_path}.meta")
 
                 # Recupera parts_count original caso salvo em sessão anterior
                 if meta_path.exists():
@@ -1029,10 +1619,7 @@ def download_strm_multipart(
                 meta_path.unlink(missing_ok=True)
 
         tmp_path.replace(target_path)
-        # Limpar sobras de arquivos temporários
-        for leftover in target_path.parent.glob(f".{target_path.stem}.*.download*"):
-            with contextlib.suppress(Exception):
-                leftover.unlink(missing_ok=True)
+        cleanup_staging_partials(target_path, staging_dirs)
         return target_path
 
     except Exception:
@@ -1095,6 +1682,8 @@ def register_in_nebula_queue(
     db_name: str = "ftp",
     library_user: str = "raphael",
     delete_source: bool = True,
+    recovery_file_id: str | None = None,
+    priority: int = 0,
 ) -> bool:
     """
     Registra a mídia baixada na coleção files do MongoDB do Nebula com status='queued'
@@ -1112,40 +1701,108 @@ def register_in_nebula_queue(
         client = MongoClient(mongo_uri, serverSelectionTimeoutMS=3000)
         files = client[db_name].files
 
+        recovery_filter = {
+            "type": "file",
+            "status": {"$in": list(ACTIVE_STATUSES)},
+            "recovery_required": True,
+            "failed_reason": "local_path_missing",
+        }
+        recovery_doc = None
+        if recovery_file_id:
+            id_candidates = []
+            try:
+                id_candidates.append(ObjectId(recovery_file_id))
+            except Exception:
+                pass
+            id_candidates.append(recovery_file_id)
+            for candidate_id in id_candidates:
+                recovery_doc = files.find_one(
+                    {"_id": candidate_id, **recovery_filter},
+                    {"_id": 1},
+                )
+                if recovery_doc:
+                    break
+        if not recovery_doc:
+            recovery_doc = files.find_one(
+                {
+                    **recovery_filter,
+                    "parent": parent_path,
+                    "name": destination.name,
+                },
+                {"_id": 1},
+            )
+
+        update_values = {
+            "type": "file",
+            "name": destination.name,
+            "parent": parent_path,
+            "size": size,
+            "status": "queued",
+            "local_path": str(downloaded_file),
+            "mtime": now,
+            "delete_source": bool(delete_source),
+            "priority": int(priority),
+            "search_name": destination.name.strip().casefold(),
+            "search_parent": parent_path.strip().casefold(),
+        }
+
+        if recovery_doc:
+            result = files.update_one(
+                {
+                    "_id": recovery_doc["_id"],
+                    **recovery_filter,
+                },
+                {
+                    "$set": {
+                        **update_values,
+                        "recovery_required": False,
+                        "failed_reason": None,
+                    },
+                    "$unset": {"failed_at": ""},
+                },
+            )
+            if getattr(result, "matched_count", 1) == 0:
+                logger.warning(
+                    "Recuperação mudou durante o download; STRM preservado e fila não sobrescrita: %s",
+                    destination.name,
+                )
+                return False
+            logger.info(
+                "Registro de recuperação reativado sem zerar partes/progresso: %s",
+                destination.name,
+            )
+            client.close()
+            return True
+
         # 1. Verifica se já existe por local_path
-        existing = files.find_one({"local_path": str(downloaded_file)}, {"status": 1})
+        existing = files.find_one({"local_path": str(downloaded_file)}, {"_id": 1, "status": 1})
         if existing:
             files.update_one(
                 {"_id": existing["_id"]},
-                {
-                    "$set": {
-                        "name": destination.name,
-                        "parent": parent_path,
-                        "size": size,
-                        "status": "queued",
-                        "mtime": now,
-                        "delete_source": bool(delete_source),
-                    }
-                },
+                {"$set": update_values},
             )
         else:
+            existing_target = files.find_one(
+                {"parent": parent_path, "name": destination.name},
+                {"_id": 1},
+            )
+            if existing_target:
+                logger.warning(
+                    "Destino Mongo já pertence a outro registro; preservando arquivo e STRM: %s -> %s",
+                    parent_path,
+                    destination.name,
+                )
+                client.close()
+                return False
+
             doc = {
-                "type": "file",
-                "name": destination.name,
-                "parent": parent_path,
-                "size": size,
-                "status": "queued",
-                "local_path": str(downloaded_file),
-                "mtime": now,
+                **update_values,
                 "ctime": now,
                 "parts": [],
-                "delete_source": bool(delete_source),
-                "search_name": destination.name.strip().casefold(),
-                "search_parent": parent_path.strip().casefold(),
             }
             files.update_one(
                 {"parent": parent_path, "name": destination.name},
-                {"$set": doc},
+                {"$setOnInsert": doc},
                 upsert=True,
             )
 
@@ -1212,22 +1869,19 @@ def iter_strm_files_prioritized(
                 else:
                     categorized["other"].append(item)
 
-    # 1. Animações: Séries/Episódios ordenados por temporada/episódio, filmes por ano decrescente, outros A-Z
+    # 1. Animações: Séries/Episódios por temporada/episódio, filmes e avulsos A-Z
     def animacoes_sort_key(it: tuple[Path, Path, str, int]):
         src_path = it[1]
         ep_info = episode_identity(src_path.parent.name, src_path.name)
         if ep_info:
-            return (0, ep_info[0], ep_info[1], ep_info[2])
-        year = it[3]
-        if year > 0:
-            return (1, "", -year, src_path.name.lower())
-        return (2, src_path.name.lower(), 0, 0)
+            return (0, ep_info[0].lower(), ep_info[1], ep_info[2])
+        return (1, normalize_media_title(src_path.name), 0, 0)
 
     categorized["animacoes"].sort(key=animacoes_sort_key)
 
-    # 2. Ordenação de Filmes: Ano mais recente primeiro (ex: 2026 -> 2025), desempate por nome A-Z
+    # 2. Ordenação de Filmes: Alfabética A-Z (desempate por ano decrescente se mesmo título)
     categorized["filmes"].sort(
-        key=lambda it: (-it[3], it[1].name.lower())
+        key=lambda it: (normalize_media_title(it[1].name), -it[3])
     )
 
     # Função auxiliar para ordenação de séries/doramas/novelas por temporada e episódio
@@ -1235,8 +1889,8 @@ def iter_strm_files_prioritized(
         src_path = it[1]
         ep_info = episode_identity(src_path.parent.name, src_path.name)
         if ep_info:
-            return (ep_info[0], ep_info[1], ep_info[2])
-        return (src_path.parent.name.lower(), src_path.name.lower(), 0)
+            return (ep_info[0].lower(), ep_info[1], ep_info[2])
+        return (normalize_media_title(src_path.parent.name), normalize_media_title(src_path.name), 0)
 
     # 3. Séries por nome da pasta/série, temporada e episódio
     categorized["series"].sort(key=series_sort_key)
@@ -1248,10 +1902,10 @@ def iter_strm_files_prioritized(
     categorized["novelas"].sort(key=series_sort_key)
 
     # 6. Porno ordenado estritamente A-Z
-    categorized["porno"].sort(key=lambda it: it[1].name.lower())
+    categorized["porno"].sort(key=lambda it: normalize_media_title(it[1].name))
 
     # Outros ordenados A-Z
-    categorized["other"].sort(key=lambda it: it[1].name.lower())
+    categorized["other"].sort(key=lambda it: normalize_media_title(it[1].name))
 
     # Monta a fila combinada por prioridade
     results: list[tuple[Path, Path, str, int]] = []
@@ -1259,7 +1913,115 @@ def iter_strm_files_prioritized(
         results.extend(categorized[cat])
     results.extend(categorized["other"])
 
+    priority_config = load_m3u_priority_config()
+    results.sort(key=lambda item: not is_priority_item(item[0], item[1], priority_config))
     return results
+
+
+def sort_strm_batch(
+    items: list[tuple[Path, Path, str, int]],
+) -> list[tuple[Path, Path, str, int]]:
+    """Apply the existing category/year order to a bounded scan batch."""
+    categorized: dict[str, list[tuple[Path, Path, str, int]]] = {
+        cat: [] for cat in CATEGORY_PRIORITY
+    }
+    categorized["other"] = []
+    for item in items:
+        category = item[2]
+        categorized[category if category in categorized else "other"].append(item)
+
+    def episode_sort_key(item: tuple[Path, Path, str, int]):
+        src_path = item[1]
+        ep_info = episode_identity(src_path.parent.name, src_path.name)
+        if ep_info:
+            return (ep_info[0].lower(), ep_info[1], ep_info[2])
+        return (src_path.parent.name.lower(), src_path.name.lower(), 0)
+
+    categorized["animacoes"].sort(
+        key=lambda item: (
+            (0, ep_info[0].lower(), ep_info[1], ep_info[2])
+            if (ep_info := episode_identity(item[1].parent.name, item[1].name))
+            else (1, normalize_media_title(item[1].name), 0, 0)
+        )
+    )
+    categorized["filmes"].sort(key=lambda item: (normalize_media_title(item[1].name), -item[3]))
+    for category in ("series", "doramas", "novelas"):
+        categorized[category].sort(key=episode_sort_key)
+    categorized["porno"].sort(key=lambda item: normalize_media_title(item[1].name))
+    categorized["other"].sort(key=lambda item: normalize_media_title(item[1].name))
+
+    ordered = [item for category in CATEGORY_PRIORITY for item in categorized[category]] + categorized["other"]
+    priority_config = load_m3u_priority_config()
+    ordered.sort(key=lambda item: not is_priority_item(item[0], item[1], priority_config))
+    return ordered
+
+
+def iter_strm_file_batches_prioritized(
+    sources: list[Path],
+    exclude_dirs: set[str] | None = None,
+    *,
+    batch_size: int = 250,
+    progress_callback=None,
+    progress_interval: float = 10.0,
+):
+    """Yield sorted bounded batches so a large library need not be fully indexed first.
+
+    Category and year priority is preserved within each batch. This lets the
+    downloader start work promptly while the remaining library is still being
+    scanned.
+    """
+    if batch_size < 1:
+        raise ValueError("batch_size deve ser positivo")
+
+    exclude = {directory.lower() for directory in (exclude_dirs or set())}
+    batch: list[tuple[Path, Path, str, int]] = []
+    directories_seen = 0
+    files_seen = 0
+    candidates_seen = 0
+    next_progress = time.monotonic() + progress_interval
+
+    for source in sources:
+        if not source.exists():
+            continue
+        for root, dirs, files in os.walk(source):
+            directories_seen += 1
+            root_path = Path(root)
+            try:
+                rel_parts = root_path.relative_to(source).parts
+                if rel_parts and rel_parts[0].lower() in exclude:
+                    dirs[:] = []
+                    continue
+            except ValueError:
+                pass
+
+            if root_path == source:
+                dirs.sort(key=lambda d: (category_dir_priority(d), normalize_media_title(d)))
+            else:
+                dirs.sort(key=normalize_media_title)
+
+            files.sort(key=normalize_media_title)
+
+            for name in files:
+                files_seen += 1
+                ext = Path(name).suffix.lower()
+                if ext in MONITORED_EXTENSIONS and not is_incomplete_filename(name):
+                    media_path = root_path / name
+                    category = get_category_from_path(media_path, source)
+                    year = extract_media_year(media_path.name, media_path.parent.name)
+                    batch.append((source, media_path, category, year))
+                    candidates_seen += 1
+
+                    if len(batch) >= batch_size:
+                        yield sort_strm_batch(batch)
+                        batch = []
+
+                now = time.monotonic()
+                if progress_callback and now >= next_progress:
+                    progress_callback(directories_seen, files_seen, candidates_seen)
+                    next_progress = now + progress_interval
+
+    if batch:
+        yield sort_strm_batch(batch)
 
 
 # =====================================================================
@@ -1361,11 +2123,13 @@ def prune_completed_strm_files(
                         url = read_strm_url(media_path)
                         media_ext = guess_media_extension(url)
                         dest_file = destination_for(source, dest_root, media_path.with_suffix(media_ext))
-                        is_dupe, _ = validator.is_already_completed_or_active(media_path, url, dest_file, dest_root)
+                        if validator.is_recovery_candidate(media_path, url, dest_file, dest_root):
+                            continue
+                        is_dupe, reason = validator.is_already_completed_or_active(media_path, url, dest_file, dest_root)
                     else:
                         dest_file = destination_for(source, dest_root, media_path)
-                        is_dupe, _ = validator.is_already_completed_or_active(media_path, "", dest_file, dest_root)
-                    if is_dupe:
+                        is_dupe, reason = validator.is_already_completed_or_active(media_path, "", dest_file, dest_root)
+                    if is_dupe and "ativa/em fila" not in reason:
                         delete_strm_and_empty_parents(media_path, source, dry_run=dry_run)
                         removed += 1
                 except Exception:
@@ -1407,6 +2171,8 @@ def process_strm_item(
     """
     with DOWNLOAD_LOCK:
         is_strm = strm_path.suffix.lower() == ".strm"
+        priority = int(is_priority_item(source_root, strm_path))
+        priority_kwargs = {"priority": priority} if priority else {}
 
         if is_strm:
             try:
@@ -1417,9 +2183,34 @@ def process_strm_item(
                     failure_tracker.record_failure(strm_path, f"Erro de leitura: {exc}")
                 return False
 
+            canonical_parent = validator.canonical_parent_for_stream(url)
+            if extract_stream_file_id(url) and not validator.last_parent_lookup_available:
+                logger.warning("Mongo indisponível; download adiado para não usar categoria possivelmente errada: %s", strm_path)
+                return False
+            if canonical_parent:
+                corrected_path = relocate_strm_to_mongo_parent(
+                    strm_path,
+                    source_root,
+                    canonical_parent,
+                    library_user,
+                    dry_run=dry_run,
+                )
+                if corrected_path is None:
+                    return False
+                if corrected_path != strm_path:
+                    strm_path = corrected_path
+                    category = get_category_from_path(strm_path, source_root)
+                    year = extract_media_year(strm_path.name, strm_path.parent.name)
+
             media_ext = guess_media_extension(url)
             media_source = strm_path.with_suffix(media_ext)
             destination = destination_for(source_root, dest_root, media_source)
+            is_recovery = validator.is_recovery_candidate(
+                strm_path,
+                url,
+                destination,
+                dest_root,
+            )
 
             # 1. Validação de Mídia Concluída ou Ativa
             is_dupe, reason = validator.is_already_completed_or_active(
@@ -1429,8 +2220,15 @@ def process_strm_item(
                 dest_root=dest_root,
             )
             if is_dupe:
-                logger.info("Mídia já concluída ou ativa no Nebula (%s). Removendo .strm: %s", reason, strm_path.name)
-                delete_strm_and_empty_parents(strm_path, source_root, dry_run=dry_run)
+                if "ativa/em fila" in reason:
+                    logger.info(
+                        "Mídia já ativa no Nebula (%s); preservando .strm para nova recuperação se necessário: %s",
+                        reason,
+                        strm_path.name,
+                    )
+                else:
+                    logger.info("Mídia já concluída no Nebula (%s). Removendo .strm: %s", reason, strm_path.name)
+                    delete_strm_and_empty_parents(strm_path, source_root, dry_run=dry_run)
                 if failure_tracker:
                     failure_tracker.record_success(strm_path)
                 return False
@@ -1481,6 +2279,7 @@ def process_strm_item(
                     target_path=target_stage_file,
                     parts_count=parts_count,
                     min_free_percent=min_free_percent,
+                    staging_dirs=staging_dirs,
                 )
             except Exception as exc:
                 err_msg = format_download_error(exc)
@@ -1498,11 +2297,20 @@ def process_strm_item(
                 db_name=db_name,
                 library_user=library_user,
                 delete_source=True,
+                recovery_file_id=extract_stream_file_id(url) if is_recovery else None,
+                **priority_kwargs,
             )
 
-            # 5. Se registrado com sucesso, remove .strm e pasta pai vazia
+            # Keep a recovery source link until its re-upload completes in Telegram.
             if registered:
-                delete_strm_and_empty_parents(strm_path, source_root, dry_run=dry_run)
+                if is_recovery:
+                    logger.info(
+                        "STRM preservado até o upload recuperado concluir: %s",
+                        strm_path.name,
+                    )
+                    validator.refresh_cache(force=True)
+                else:
+                    delete_strm_and_empty_parents(strm_path, source_root, dry_run=dry_run)
                 if failure_tracker:
                     failure_tracker.record_success(strm_path)
                 logger.info("[1 MÍDIA POR VEZ] Conclusão do processamento de: %s. Pronto para a próxima mídia.", strm_path.name)
@@ -1558,7 +2366,12 @@ def process_strm_item(
                 delete_strm_and_empty_parents(strm_path, source_root, dry_run=True)
                 return True
 
-            wait_for_disk_capacity(target_stage_file, file_size, min_free_percent)
+            target_stage_file = wait_for_disk_capacity(
+                target_stage_file,
+                file_size,
+                min_free_percent,
+                staging_dirs=staging_dirs,
+            ) or target_stage_file
             target_stage_file.parent.mkdir(parents=True, exist_ok=True)
 
             try:
@@ -1583,7 +2396,8 @@ def process_strm_item(
                 db_name=db_name,
                 library_user=library_user,
                 delete_source=True,
-            )
+                **priority_kwargs,
+                )
 
             if registered:
                 if failure_tracker:
@@ -1634,24 +2448,63 @@ def run_downloader(args: argparse.Namespace) -> int:
         try:
             if failure_tracker:
                 failure_tracker.reset_cycle()
-            logger.info("Escaneando e priorizando arquivos .strm...")
-            items = iter_strm_files_prioritized(sources, exclude_dirs)
+            validator.refresh_cache(force=True)
             # Prioriza mídias que já tenham partes baixadas em stage para que continuem e terminem imediatamente
             def item_has_partial(it):
                 _, m_path, _, _ = it
                 return not has_partial_download_on_disk(m_path.stem, staging_dirs)
 
-            items.sort(key=item_has_partial)
-            logger.info("Total de arquivos .strm encontrados: %d", len(items))
+            def item_needs_recovery(it):
+                source_root, media_path, _, _ = it
+                if media_path.suffix.lower() != ".strm":
+                    return False
+                try:
+                    url = read_strm_url(media_path)
+                    media_ext = guess_media_extension(url)
+                    destination = destination_for(
+                        source_root,
+                        dest_root,
+                        media_path.with_suffix(media_ext),
+                    )
+                except Exception:
+                    return False
+                return validator.is_recovery_candidate(
+                    media_path,
+                    url,
+                    destination,
+                    dest_root,
+                )
 
+            logger.info(
+                "Escaneando .strm em lotes de até 250; a primeira mídia elegível "
+                "será processada antes de terminar a varredura da biblioteca."
+            )
+            scanned_candidates = 0
+            batch_number = 0
             processed_any = False
-            for source_root, strm_path, category, year in items:
+            handled_recovery_paths: set[str] = set()
+            priority_config = load_m3u_priority_config()
+
+            # Use Mongo's persisted destinations to find known recovery STRMs
+            # directly, so they are retried before ordinary library candidates.
+            recovery_items = validator.find_recovery_strm_items(
+                sources,
+                dest_root,
+            )
+            if recovery_items:
+                recovery_items.sort(key=item_has_partial)
+                logger.info(
+                    "Prioridade de recuperação: %d STRM(s) com arquivo local ausente serão processados primeiro.",
+                    len(recovery_items),
+                )
+            for recovery_item in recovery_items:
+                source_root, strm_path, category, year = recovery_item
+                handled_recovery_paths.add(str(strm_path.resolve()).casefold())
                 stats.scanned += 1
 
-                # Checagem contra loop de mídias que falharam recentemente (401/404/erros)
                 should_skip, skip_reason = failure_tracker.should_skip(strm_path, staging_dirs)
                 if should_skip:
-                    logger.debug("Pulando mídia com falha recente: %s (%s)", strm_path.name, skip_reason)
+                    logger.info("Recuperação adiada por proteção de falha/retry: %s (%s)", strm_path.name, skip_reason)
                     continue
 
                 success = process_strm_item(
@@ -1674,10 +2527,84 @@ def run_downloader(args: argparse.Namespace) -> int:
                     stats.downloaded += 1
                     stats.queued += 1
                     processed_any = True
-                    # Breve pausa para o Nebula consumir/respirar
                     time.sleep(1)
                 else:
                     stats.failed += 1
+
+            def log_scan_progress(directories, files, candidates):
+                logger.info(
+                    "Varredura em andamento: pastas=%d arquivos_verificados=%d "
+                    "candidatos=%d lotes_processados=%d",
+                    directories,
+                    files,
+                    candidates,
+                    batch_number,
+                )
+
+            for items in iter_strm_file_batches_prioritized(
+                sources,
+                exclude_dirs,
+                batch_size=250,
+                progress_callback=log_scan_progress,
+            ):
+                batch_number += 1
+                scanned_candidates += len(items)
+                items.sort(key=lambda item: (
+                    not item_needs_recovery(item),
+                    item_has_partial(item),
+                    not is_priority_item(item[0], item[1], priority_config),
+                ))
+                logger.info(
+                    "Lote %d disponível (%d mídias; %d encontradas até agora); "
+                    "iniciando processamento.",
+                    batch_number,
+                    len(items),
+                    scanned_candidates,
+                )
+
+                for source_root, strm_path, category, year in items:
+                    strm_key = str(strm_path.resolve()).casefold()
+                    if strm_key in handled_recovery_paths:
+                        continue
+                    was_recovery = item_needs_recovery(
+                        (source_root, strm_path, category, year)
+                    )
+                    stats.scanned += 1
+
+                    # Checagem contra loop de mídias que falharam recentemente (401/404/erros)
+                    should_skip, skip_reason = failure_tracker.should_skip(strm_path, staging_dirs)
+                    if should_skip:
+                        logger.info("Pulando mídia com falha recente (quarentena ativa): %s (%s)", strm_path.name, skip_reason)
+                        continue
+
+                    success = process_strm_item(
+                        source_root=source_root,
+                        strm_path=strm_path,
+                        category=category,
+                        year=year,
+                        dest_root=dest_root,
+                        staging_dirs=staging_dirs,
+                        validator=validator,
+                        mongo_uri=mongo_uri,
+                        db_name=db_name,
+                        library_user=library_user,
+                        parts_count=args.parts,
+                        min_free_percent=args.min_free_percent,
+                        dry_run=args.dry_run,
+                        failure_tracker=failure_tracker,
+                    )
+                    if success:
+                        stats.downloaded += 1
+                        stats.queued += 1
+                        processed_any = True
+                        # Breve pausa para o Nebula consumir/respirar
+                        time.sleep(1)
+                    else:
+                        stats.failed += 1
+                    if was_recovery:
+                        handled_recovery_paths.add(strm_key)
+
+            logger.info("Varredura concluída: %d arquivos elegíveis encontrados.", scanned_candidates)
 
             if not args.watch:
                 break

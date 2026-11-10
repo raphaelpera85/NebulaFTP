@@ -1222,6 +1222,7 @@ async def restore_pending_uploads(mongo):
     query = {"type": "file", "status": {"$in": ["queued", "uploading", "staging"]}, "local_path": {"$exists": True}}
     pending = [doc async for doc in mongo.files.find(query)]
     pending.sort(key=lambda doc: (
+        -int(doc.get("priority", 0) or 0),
         doc_download_timestamp(doc),
         doc.get("name", "").lower(),
     ))
@@ -1296,7 +1297,7 @@ async def queued_mongo_scanner(mongo, max_workers=None):
                 doc = await mongo.files.find_one_and_update(
                     q,
                     {"$set": {"status": "staging", "staged_at": int(time.time())}},
-                    sort=[("mtime", 1), ("ctime", 1), ("_id", 1)],
+                    sort=[("priority", -1), ("mtime", 1), ("ctime", 1), ("_id", 1)],
                 )
                 if not doc:
                     break
@@ -2402,13 +2403,19 @@ async def handle_http_client(reader, writer, mongo, bots):
         else:
             await http_index(writer, mongo, params.get("q", [""])[0], head_only)
     except Exception as exc:
-        if isinstance(exc, (ConnectionResetError, BrokenPipeError, asyncio.IncompleteReadError)):
+        is_client_disconnect = (
+            isinstance(exc, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, asyncio.IncompleteReadError))
+            or (isinstance(exc, OSError) and getattr(exc, "winerror", None) in (10053, 10054))
+            or "Connection lost" in str(exc)
+        )
+        if is_client_disconnect:
             logger.debug("HTTP stream desconectado: %s", exc)
         else:
             logger.warning("HTTP stream erro: %s", exc)
-        with contextlib.suppress(Exception):
-            writer.write(http_headers(500, "text/plain; charset=utf-8", b"erro interno"))
-            await writer.drain()
+        if not is_client_disconnect:
+            with contextlib.suppress(Exception):
+                writer.write(http_headers(500, "text/plain; charset=utf-8", b"erro interno"))
+                await writer.drain()
     finally:
         writer.close()
         with contextlib.suppress(Exception):

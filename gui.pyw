@@ -87,6 +87,58 @@ def find_rclone_exe() -> str | None:
     return None
 
 
+def upload_status_label(doc: dict) -> str:
+    """Describe persisted upload state without implying queued work is active."""
+    status = doc.get("status")
+    if status == "uploading":
+        worker_id = doc.get("worker_id")
+        worker = f"Worker #{worker_id}" if worker_id is not None else "Worker ativo"
+        return f"Uploading | {worker}"
+
+    if doc.get("recovery_required"):
+        reason = doc.get("failed_reason")
+        if reason == "local_path_missing":
+            return "Aguardando arquivo local — recuperação necessária"
+        if reason == "duplicate_target_preserved":
+            return "Duplicado preservado — revisão necessária"
+        return "Recuperação necessária — aguardando ação"
+
+    if status == "staging":
+        return "Preparado — aguardando worker de envio"
+    return "Na fila — aguardando envio"
+
+
+def should_display_upload_card(doc: dict) -> bool:
+    """Return True only for active uploads or items requiring recovery."""
+    return doc.get("status") == "uploading" or bool(doc.get("recovery_required"))
+
+
+def upload_bot_indexes(parts) -> list[int]:
+    """Return valid bot indexes while ignoring malformed persisted part data."""
+    if not isinstance(parts, list):
+        return []
+    return sorted(
+        {
+            part["bot_index"] + 1
+            for part in parts
+            if isinstance(part, dict)
+            and type(part.get("bot_index")) is int
+        }
+    )
+
+
+def parse_downloader_scan_progress(line: str) -> tuple[int, int, int, int] | None:
+    """Extract directory/file/candidate/batch counts from scan log lines."""
+    match = re.search(
+        r"Varredura em andamento: pastas=(\d+) arquivos_verificados=(\d+) "
+        r"candidatos=(\d+) lotes_processados=(\d+)",
+        line,
+    )
+    if not match:
+        return None
+    return tuple(int(value) for value in match.groups())
+
+
 
 class NebulaGUI:
     def __init__(self, root):
@@ -148,6 +200,16 @@ class NebulaGUI:
         self.mongo_uri = os.environ.get("MONGODB", "mongodb://localhost:27017")
         self.stage_settings_file = os.path.abspath("stage_paths.json")
         self.monitor_settings_file = os.path.abspath("monitor_paths.json")
+        self.m3u_config_file = os.path.abspath("m3u_strm_config.json")
+        self.m3u_catalog_file = os.path.abspath("m3u_strm_catalog.json")
+        self.m3u_priority_file = os.path.abspath("m3u_priority.json")
+
+        # M3U sync state
+        self._m3u_running = False
+        self._m3u_timer_id = None
+        self.m3u_catalog = []
+        self.m3u_search_results = []
+        self.m3u_priorities = {"paths": [], "terms": []}
 
         self.file_bars = {}
         self.current_download_info = {}
@@ -249,9 +311,14 @@ class NebulaGUI:
         self.tab_download = tk.Frame(self.notebook, bg=self.bg_color)
         self.notebook.add(self.tab_download, text="  📥 Download STRM  ")
 
+        # Aba 3: IPTV M3U → STRM
+        self.tab_iptv = tk.Frame(self.notebook, bg=self.bg_color)
+        self.notebook.add(self.tab_iptv, text="  📡 IPTV M3U  ")
+
         # Montar conteúdo de cada aba
         self._build_nebula_tab()
         self._build_download_tab()
+        self._build_iptv_tab()
 
     # =========================================================================
     # ABA 1: NEBULA (ENVIO DE MÍDIAS)
@@ -376,7 +443,11 @@ class NebulaGUI:
         self.scroll_content = tk.Frame(self.canvas, bg="#181825")
 
         self.scroll_content.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        self.canvas.create_window((0, 0), window=self.scroll_content, anchor="nw")
+        self.canvas_window = self.canvas.create_window((0, 0), window=self.scroll_content, anchor="nw")
+        self.canvas.bind(
+            "<Configure>",
+            lambda e: self.canvas.itemconfig(self.canvas_window, width=e.width),
+        )
         self.canvas.configure(yscrollcommand=self.scrollbar.set)
 
         self.canvas.pack(side="left", fill="both", expand=True)
@@ -646,7 +717,7 @@ class NebulaGUI:
         # Badge Regra 1 Mídia por Vez
         rule_badge = tk.Label(
             action_frame,
-            text="🔒 1 Mídia por Vez | Prioridade: Filmes (Ano Desc) > Pornô > Séries",
+            text="🔒 1 Mídia por Vez | Prioridade por lote: Animações > Filmes > Séries > Doramas > Novelas > Pornô",
             font=("Segoe UI", 9, "bold"),
             bg="#313244",
             fg=self.accent_color,
@@ -727,6 +798,498 @@ class NebulaGUI:
 
         self.dl_log_text.pack(side="left", fill="both", expand=True)
         dl_log_scrollbar.pack(side="right", fill="y")
+
+    # =========================================================================
+    # ABA 3: IPTV M3U → STRM
+    # =========================================================================
+    def _build_iptv_tab(self):
+        """Constrói a aba de geração automática de STRMs a partir de M3U IPTV."""
+
+        # --- Helpers de estilo reutilizados da GUI principal ---
+        def card(parent, title):
+            frm = tk.LabelFrame(
+                parent,
+                text=f" {title} ",
+                font=("Segoe UI", 10, "bold"),
+                bg=self.card_bg,
+                fg=self.fg_color,
+                pady=8,
+                padx=12,
+                relief="flat",
+                bd=1,
+            )
+            frm.pack(fill="x", padx=10, pady=(8, 0))
+            return frm
+
+        def row(parent):
+            f = tk.Frame(parent, bg=self.card_bg)
+            f.pack(fill="x", pady=3)
+            return f
+
+        def lbl(parent, text, bold=False):
+            font = ("Segoe UI", 9, "bold") if bold else ("Segoe UI", 9)
+            return tk.Label(parent, text=text, font=font, bg=self.card_bg, fg=self.fg_color)
+
+        def entry_var(parent, var, width=60):
+            return tk.Entry(
+                parent,
+                textvariable=var,
+                font=("Consolas", 9),
+                bg="#181825",
+                fg=self.fg_color,
+                insertbackground=self.fg_color,
+                bd=0,
+                highlightthickness=1,
+                highlightcolor=self.accent_color,
+                highlightbackground="#45475a",
+                width=width,
+            )
+
+        def btn(parent, text, command, color=None, state="normal", width=None):
+            kw = dict(
+                text=text,
+                command=command,
+                font=("Segoe UI", 9, "bold"),
+                bg=color or "#45475a",
+                fg="#11111b" if color else "white",
+                bd=0,
+                padx=10,
+                pady=4,
+                cursor="hand2",
+                relief="flat",
+                state=state,
+            )
+            if width:
+                kw["width"] = width
+            return tk.Button(parent, **kw)
+
+        # ---- Card 1: Configuração da URL M3U ----
+        cfg = card(self.tab_iptv, "⚙ Configuração M3U")
+
+        r1 = row(cfg)
+        lbl(r1, "URL do arquivo M3U:", bold=True).pack(side="left", padx=(0, 8))
+        self.m3u_url_var = tk.StringVar()
+        url_entry = entry_var(r1, self.m3u_url_var, width=55)
+        url_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        btn(r1, "🔍 Testar URL", self._m3u_test_url).pack(side="left")
+
+        r2 = row(cfg)
+        lbl(r2, "Pasta de destino das mídias:", bold=True).pack(side="left", padx=(0, 8))
+        self.m3u_dest_var = tk.StringVar(value=r"D:\midias")
+        entry_var(r2, self.m3u_dest_var, width=35).pack(side="left", fill="x", expand=True, padx=(0, 8))
+        btn(r2, "📂 Escolher", self._m3u_browse_dest).pack(side="left")
+
+        r3 = row(cfg)
+        lbl(r3, "Intervalo de atualização (minutos):", bold=True).pack(side="left", padx=(0, 8))
+        self.m3u_interval_var = tk.IntVar(value=60)
+        tk.Spinbox(
+            r3,
+            textvariable=self.m3u_interval_var,
+            from_=10,
+            to=1440,
+            increment=10,
+            width=6,
+            font=("Consolas", 9),
+            bg="#181825",
+            fg=self.fg_color,
+            buttonbackground="#45475a",
+            relief="flat",
+        ).pack(side="left", padx=(0, 20))
+
+        self.m3u_recovery_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            r3,
+            text="Corrigir automaticamente STRMs em recuperação",
+            variable=self.m3u_recovery_var,
+            font=("Segoe UI", 9),
+            bg=self.card_bg,
+            fg=self.fg_color,
+            selectcolor="#313244",
+            activebackground=self.card_bg,
+            activeforeground=self.fg_color,
+            bd=0,
+        ).pack(side="left")
+
+        # ---- Card 2: Controles ----
+        ctrl = card(self.tab_iptv, "▶ Controles")
+        ctrl_row = row(ctrl)
+
+        self.btn_m3u_start = btn(
+            ctrl_row, "▶ Iniciar Sincronização", self._m3u_start, color=self.success_color
+        )
+        self.btn_m3u_start.pack(side="left", padx=(0, 8))
+
+        self.btn_m3u_stop = btn(
+            ctrl_row, "⏹ Parar", self._m3u_stop, color=self.stop_color, state="disabled"
+        )
+        self.btn_m3u_stop.pack(side="left", padx=(0, 8))
+
+        self.btn_m3u_now = btn(
+            ctrl_row, "🔄 Executar Agora", self._m3u_run_now, color=self.accent_color
+        )
+        self.btn_m3u_now.pack(side="left", padx=(0, 8))
+
+        btn(ctrl_row, "💾 Salvar Config", self._m3u_save_config).pack(side="left")
+
+        # ---- Card 3: Status ----
+        stat_card = card(self.tab_iptv, "📊 Status")
+
+        self.m3u_status_lbl = tk.Label(
+            stat_card,
+            text="Aguardando...",
+            font=("Segoe UI", 9, "bold"),
+            bg=self.card_bg,
+            fg=self.accent_color,
+            anchor="w",
+        )
+        self.m3u_status_lbl.pack(fill="x", pady=(0, 2))
+
+        self.m3u_last_run_lbl = tk.Label(
+            stat_card,
+            text="Última execução: —",
+            font=("Segoe UI", 8, "italic"),
+            bg=self.card_bg,
+            fg="#a6adc8",
+            anchor="w",
+        )
+        self.m3u_last_run_lbl.pack(fill="x")
+
+        self.m3u_stats_lbl = tk.Label(
+            stat_card,
+            text="Criados: — | Ignorados: — | Recuperados: — | Erros: —",
+            font=("Consolas", 8),
+            bg=self.card_bg,
+            fg="#a6adc8",
+            anchor="w",
+        )
+        self.m3u_stats_lbl.pack(fill="x")
+
+        # ---- Busca e prioridade de download/upload ----
+        search_card = card(self.tab_iptv, "🔎 Buscar e priorizar mídia")
+        search_row = row(search_card)
+        lbl(search_row, "Digite título, série, episódio ou categoria:", bold=True).pack(side="left", padx=(0, 8))
+        self.m3u_search_var = tk.StringVar()
+        self.m3u_search_var.trace_add("write", lambda *_: self._m3u_search())
+        entry_var(search_row, self.m3u_search_var, width=42).pack(side="left", fill="x", expand=True, padx=(0, 8))
+        btn(search_row, "⭐ Priorizar selecionada", self._m3u_prioritize_selected, color=self.accent_color).pack(side="left", padx=(0, 6))
+        btn(search_row, "Limpar", self._m3u_clear_priority).pack(side="left")
+
+        results_frame = tk.Frame(search_card, bg=self.card_bg)
+        results_frame.pack(fill="x", pady=(4, 0))
+        self.m3u_search_list = tk.Listbox(
+            results_frame,
+            height=5,
+            font=("Consolas", 8),
+            bg="#181825",
+            fg=self.fg_color,
+            selectbackground=self.accent_color,
+            selectforeground="#11111b",
+            bd=0,
+            highlightthickness=0,
+            exportselection=False,
+        )
+        self.m3u_search_list.pack(side="left", fill="x", expand=True)
+        search_scroll = ttk.Scrollbar(results_frame, orient="vertical", command=self.m3u_search_list.yview)
+        self.m3u_search_list.configure(yscrollcommand=search_scroll.set)
+        search_scroll.pack(side="right", fill="y")
+        self.m3u_priority_lbl = tk.Label(
+            search_card,
+            text="Prioridade: nenhuma mídia selecionada",
+            font=("Segoe UI", 8, "italic"),
+            bg=self.card_bg,
+            fg="#a6adc8",
+            anchor="w",
+        )
+        self.m3u_priority_lbl.pack(fill="x", pady=(3, 0))
+
+        # ---- Log ----
+        log_frame = tk.LabelFrame(
+            self.tab_iptv,
+            text=" 📜 Log M3U → STRM ",
+            font=("Segoe UI", 10, "bold"),
+            bg=self.bg_color,
+            fg=self.fg_color,
+            pady=5,
+            padx=10,
+        )
+        log_frame.pack(fill="both", expand=True, padx=10, pady=(8, 10))
+
+        self.m3u_log_text = tk.Text(
+            log_frame,
+            font=("Consolas", 9),
+            bg="#11111b",
+            fg="#a6adc8",
+            bd=0,
+            wrap="word",
+        )
+        m3u_log_scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.m3u_log_text.yview)
+        self.m3u_log_text.configure(yscrollcommand=m3u_log_scroll.set)
+        self.m3u_log_text.pack(side="left", fill="both", expand=True)
+        m3u_log_scroll.pack(side="right", fill="y")
+
+        # Carrega config salva
+        self._m3u_load_config()
+        self._m3u_load_catalog()
+        self._m3u_load_priority()
+
+    def _m3u_load_catalog(self):
+        try:
+            with open(self.m3u_catalog_file, encoding="utf-8") as handle:
+                value = json.load(handle)
+            self.m3u_catalog = value if isinstance(value, list) else []
+        except (OSError, ValueError):
+            self.m3u_catalog = []
+
+    def _m3u_load_priority(self):
+        try:
+            with open(self.m3u_priority_file, encoding="utf-8") as handle:
+                value = json.load(handle)
+            if isinstance(value, dict):
+                self.m3u_priorities = {
+                    "paths": [str(item) for item in value.get("paths", [])],
+                    "terms": [str(item) for item in value.get("terms", [])],
+                }
+        except (OSError, ValueError):
+            pass
+        self._m3u_update_priority_label()
+
+    def _m3u_save_priority(self):
+        with open(self.m3u_priority_file, "w", encoding="utf-8") as handle:
+            json.dump(self.m3u_priorities, handle, ensure_ascii=False, indent=2)
+        self._m3u_update_priority_label()
+
+    def _m3u_update_priority_label(self):
+        count = len(set(self.m3u_priorities.get("paths", [])))
+        self.m3u_priority_lbl.config(
+            text=(
+                f"Prioridade ativa: {count} mídia(s) — o Downloader processará primeiro "
+                "e o upload respeitará a mesma prioridade."
+                if count else "Prioridade: nenhuma mídia selecionada"
+            )
+        )
+
+    def _m3u_search(self):
+        query = self.m3u_search_var.get().strip().casefold()
+        self.m3u_search_list.delete(0, tk.END)
+        self.m3u_search_results = []
+        if not query:
+            return
+
+        items = list(self.m3u_catalog)
+        dest = self.m3u_dest_var.get().strip() or r"D:\midias"
+        if os.path.isdir(dest):
+            known = {str(item.get("relative_path", "")).casefold() for item in items}
+            for root, _, files in os.walk(dest):
+                for filename in files:
+                    if not filename.casefold().endswith(".strm"):
+                        continue
+                    full = os.path.join(root, filename)
+                    relative = os.path.relpath(full, dest)
+                    if relative.casefold() not in known:
+                        items.append({
+                            "name": os.path.splitext(filename)[0],
+                            "category": relative.split(os.sep, 1)[0],
+                            "media_type": "strm",
+                            "relative_path": relative,
+                        })
+
+        for item in items:
+            haystack = " ".join(
+                str(item.get(key, ""))
+                for key in ("name", "group", "category", "media_type", "relative_path")
+            ).casefold()
+            if query not in haystack:
+                continue
+            self.m3u_search_results.append(item)
+            self.m3u_search_list.insert(
+                tk.END,
+                f"[{item.get('category', '—')}] {item.get('name', '—')} — {item.get('relative_path', '—')}",
+            )
+            if len(self.m3u_search_results) >= 100:
+                break
+
+    def _m3u_prioritize_selected(self):
+        selected = list(self.m3u_search_list.curselection())
+        if not selected:
+            messagebox.showwarning("Nenhuma mídia", "Selecione uma mídia na busca.", parent=self.root)
+            return
+        paths = set(self.m3u_priorities.get("paths", []))
+        terms = set(self.m3u_priorities.get("terms", []))
+        for index in selected:
+            item = self.m3u_search_results[index]
+            relative = str(item.get("relative_path", ""))
+            if relative:
+                paths.add(relative)
+            name = str(item.get("name", "")).strip()
+            if name:
+                terms.add(name.casefold())
+        self.m3u_priorities = {"paths": sorted(paths), "terms": sorted(terms)}
+        self._m3u_save_priority()
+        self._m3u_log(f"Prioridade adicionada para {len(selected)} mídia(s).")
+
+    def _m3u_clear_priority(self):
+        self.m3u_priorities = {"paths": [], "terms": []}
+        self._m3u_save_priority()
+        self._m3u_log("Prioridades de mídia limpas.")
+
+    def _m3u_log(self, message: str):
+        self.m3u_log_text.insert("end", f"[{time.strftime('%H:%M:%S')}] {message}\n")
+        self.m3u_log_text.see("end")
+
+    def _m3u_load_config(self):
+        if not os.path.isfile(self.m3u_config_file):
+            return
+        try:
+            cfg = json.loads(open(self.m3u_config_file, encoding="utf-8").read())
+            if cfg.get("m3u_url"):
+                self.m3u_url_var.set(cfg["m3u_url"])
+            if cfg.get("dest_root"):
+                self.m3u_dest_var.set(cfg["dest_root"])
+            if cfg.get("interval_minutes"):
+                self.m3u_interval_var.set(int(cfg["interval_minutes"]))
+            if "fix_recovery" in cfg:
+                self.m3u_recovery_var.set(bool(cfg["fix_recovery"]))
+        except Exception:
+            pass
+
+    def _m3u_save_config(self):
+        cfg = {
+            "m3u_url": self.m3u_url_var.get().strip(),
+            "dest_root": self.m3u_dest_var.get().strip(),
+            "interval_minutes": int(self.m3u_interval_var.get()),
+            "fix_recovery": bool(self.m3u_recovery_var.get()),
+        }
+        with open(self.m3u_config_file, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        self._m3u_log("Configuração salva.")
+
+    def _m3u_browse_dest(self):
+        folder = filedialog.askdirectory(initialdir=self.m3u_dest_var.get() or "D:\\")
+        if folder:
+            self.m3u_dest_var.set(folder)
+
+    def _m3u_test_url(self):
+        from tools.m3u_strm_generator import normalize_m3u_url, redact_url  # noqa: PLC0415
+
+        url = normalize_m3u_url(self.m3u_url_var.get())
+        if not url:
+            messagebox.showwarning("URL vazia", "Digite a URL do M3U antes de testar.", parent=self.root)
+            return
+        self._m3u_log(f"Testando URL: {redact_url(url)}")
+
+        def _test():
+            try:
+                import urllib.request
+                req = urllib.request.Request(
+                    url,
+                    headers={
+                        "User-Agent": "VLC/3.0.20 LibVLC/3.0.20",
+                        "Accept": "application/vnd.apple.mpegurl,*/*",
+                    },
+                )
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    first_bytes = resp.read(512).decode("utf-8", errors="replace")
+                if "#EXTM3U" in first_bytes:
+                    self.root.after(0, lambda: self._m3u_log("✅ URL válida — cabeçalho #EXTM3U detectado."))
+                else:
+                    self.root.after(0, lambda: self._m3u_log(f"⚠ URL respondeu, mas não parece M3U. Início: {first_bytes[:100]!r}"))
+            except Exception as exc:
+                self.root.after(0, lambda: self._m3u_log(f"❌ Erro ao testar URL: {exc}"))
+
+        threading.Thread(target=_test, daemon=True).start()
+
+    def _m3u_start(self):
+        url = self.m3u_url_var.get().strip()
+        if not url:
+            messagebox.showwarning("URL vazia", "Configure a URL do M3U antes de iniciar.", parent=self.root)
+            return
+        if self._m3u_running:
+            return
+        self._m3u_running = True
+        self.btn_m3u_start.config(state="disabled")
+        self.btn_m3u_stop.config(state="normal")
+        self.m3u_status_lbl.config(text="⏳ Sincronização ativa", fg=self.success_color)
+        self._m3u_log("Sincronização automática iniciada.")
+        self._m3u_save_config()
+        self._m3u_schedule_next(delay_ms=0)
+
+    def _m3u_stop(self):
+        self._m3u_running = False
+        if self._m3u_timer_id is not None:
+            self.root.after_cancel(self._m3u_timer_id)
+            self._m3u_timer_id = None
+        self.btn_m3u_start.config(state="normal")
+        self.btn_m3u_stop.config(state="disabled")
+        self.m3u_status_lbl.config(text="⏹ Parado", fg=self.fg_color)
+        self._m3u_log("Sincronização automática parada.")
+
+    def _m3u_run_now(self):
+        """Executa uma sincronização imediata (manual), sem afetar o agendamento automático."""
+        self._m3u_log("Execução manual solicitada...")
+        threading.Thread(target=self._m3u_do_sync, daemon=True).start()
+
+    def _m3u_schedule_next(self, delay_ms: int = None):
+        if not self._m3u_running:
+            return
+        if delay_ms is None:
+            delay_ms = int(self.m3u_interval_var.get()) * 60 * 1000
+        self._m3u_timer_id = self.root.after(delay_ms, self._m3u_trigger)
+
+    def _m3u_trigger(self):
+        if not self._m3u_running:
+            return
+        self.m3u_status_lbl.config(text="⏳ Sincronizando...", fg=self.accent_color)
+        threading.Thread(target=self._m3u_do_sync, daemon=True).start()
+
+    def _m3u_do_sync(self):
+        from tools.m3u_strm_generator import normalize_m3u_url, run_m3u_sync  # noqa: PLC0415
+
+        url = normalize_m3u_url(self.m3u_url_var.get())
+        dest = self.m3u_dest_var.get().strip() or r"D:\midias"
+        fix_rec = bool(self.m3u_recovery_var.get())
+
+        def _cb(msg):
+            self.root.after(0, lambda m=msg: self._m3u_log(m))
+
+        try:
+            stats = run_m3u_sync(
+                m3u_url=url,
+                dest_root=dest,
+                mongo_uri=self.mongo_uri,
+                fix_recovery=fix_rec,
+                progress_callback=_cb,
+                catalog_path=self.m3u_catalog_file,
+            )
+            ts = time.strftime("%d/%m/%Y %H:%M:%S")
+
+            def _update(s=stats, t=ts):
+                self._m3u_load_catalog()
+                self._m3u_search()
+                self.m3u_last_run_lbl.config(text=f"Última execução: {t}")
+                self.m3u_stats_lbl.config(
+                    text=(
+                        f"Criados: {s['created']} | "
+                        f"Ignorados: {s['skipped']} | "
+                        f"Recuperados: {s['recovery_fixed']} | "
+                        f"Erros: {s['errors']}"
+                    )
+                )
+                if self._m3u_running:
+                    self.m3u_status_lbl.config(text="✅ Aguardando próxima execução", fg=self.success_color)
+
+            self.root.after(0, _update)
+
+        except Exception as exc:
+            def _err(e=exc):
+                self._m3u_log(f"❌ Falha na sincronização: {e}")
+                if self._m3u_running:
+                    self.m3u_status_lbl.config(text="❌ Erro — tentando novamente no próximo ciclo", fg=self.stop_color)
+            self.root.after(0, _err)
+
+        # Agendar próxima execução automática (somente se ainda rodando)
+        if self._m3u_running:
+            interval_ms = int(self.m3u_interval_var.get()) * 60 * 1000
+            self.root.after(0, lambda: self._m3u_schedule_next(interval_ms))
 
     # =========================================================================
     # GERENCIAMENTO DE CAMINHOS & PASTAS
@@ -1217,6 +1780,10 @@ class NebulaGUI:
         self.is_downloader_running = True
         self.btn_start_dl.config(state="disabled")
         self.btn_stop_dl.config(state="normal")
+        self.dl_name_lbl.config(text="Iniciando varredura da biblioteca STRM...")
+        self.dl_meta_lbl.config(text="Aguardando o primeiro lote de candidatos.")
+        self.dl_pbar["value"] = 0
+        self.dl_pct_lbl.config(text="Varredura em andamento...")
         self._update_global_status()
 
         py_exe = get_python_exe()
@@ -1356,6 +1923,33 @@ class NebulaGUI:
         )
 
     def _parse_downloader_line(self, line):
+        scan_progress = parse_downloader_scan_progress(line)
+        if scan_progress:
+            directories, files, candidates, batches = scan_progress
+            self.dl_name_lbl.config(text="Varrendo biblioteca STRM...")
+            self.dl_meta_lbl.config(
+                text=f"Pastas: {directories:,} | Arquivos verificados: {files:,} | "
+                f"Candidatos: {candidates:,} | Lotes processados: {batches:,}"
+            )
+            self.dl_pbar["value"] = 0
+            self.dl_pct_lbl.config(text="Progresso da varredura")
+            return
+
+        batch_match = re.search(
+            r"Lote (\d+) disponível \((\d+) mídias; (\d+) encontradas até agora\); iniciando processamento",
+            line,
+            re.IGNORECASE,
+        )
+        if batch_match:
+            batch, size, candidates = (int(value) for value in batch_match.groups())
+            self.dl_name_lbl.config(text=f"Validando primeiro lote ({batch})...")
+            self.dl_meta_lbl.config(
+                text=f"{size} itens neste lote | {candidates:,} encontrados até agora"
+            )
+            self.dl_pbar["value"] = 0
+            self.dl_pct_lbl.config(text="Selecionando primeira mídia elegível...")
+            return
+
         # 1. Detecta início de download ou movimentação de mídia pronta
         m_start = re.search(
             r"Iniciando download:\s*(.+?)(?:\s+\[.+?\])?\s*->\s*Stage:\s*(.+)",
@@ -1471,53 +2065,68 @@ class NebulaGUI:
             if self.is_running:
                 try:
                     client = MongoClient(self.mongo_uri, serverSelectionTimeoutMS=1000)
-                    active_docs = list(client.ftp.files.find({"status": {"$in": ["uploading", "queued", "staging"]}}, {"name": 1, "status": 1, "size": 1, "uploaded_bytes": 1, "parts": 1, "worker_id": 1, "bot_index": 1, "mtime": 1, "ctime": 1}))
+                    active_docs = list(client.ftp.files.find(
+                        {"status": {"$in": ["uploading", "queued", "staging"]}},
+                        {
+                            "name": 1,
+                            "status": 1,
+                            "size": 1,
+                            "uploaded_bytes": 1,
+                            "parts": 1,
+                            "worker_id": 1,
+                            "bot_index": 1,
+                            "mtime": 1,
+                            "ctime": 1,
+                            "recovery_required": 1,
+                            "failed_reason": 1,
+                        },
+                    ))
                     client.close()
 
                     active_count = sum(doc.get("status") == "uploading" for doc in active_docs)
                     queued_count = len(active_docs) - active_count
+                    recovery_count = sum(bool(doc.get("recovery_required")) for doc in active_docs)
                     self.progress_frame.config(
                         text=(
                             " 📤 Uploads Ativos / Fila de Envio"
                             f"  |  Ativos: {active_count}  |  Fila: {queued_count} arquivo(s)"
+                            f"  |  Recuperação: {recovery_count}"
                         )
                     )
 
-                    # Resumed byte progress is persistent, so it does not mean
-                    # the file is currently transmitting. MongoDB status does.
-                    upload_docs = [
-                        doc
-                        for doc in active_docs
-                        if doc.get("status") == "uploading"
+                    # Apenas uploads ativos e itens em recuperação viram cards visíveis na UI.
+                    # A fila normal é totalizada numericamente no cabeçalho.
+                    visible_docs = [
+                        doc for doc in active_docs
+                        if should_display_upload_card(doc)
                     ]
-                    current_names = {doc["name"] for doc in upload_docs}
+                    current_keys = {
+                        str(doc.get("_id", doc.get("name", "Arquivo")))
+                        for doc in visible_docs
+                    }
 
                     # Remove barras antigas
-                    for name in list(self.file_bars.keys()):
-                        if name not in current_names:
-                            self.file_bars[name]["frame"].destroy()
-                            del self.file_bars[name]
+                    for key in list(self.file_bars.keys()):
+                        if key not in current_keys:
+                            self.file_bars[key]["frame"].destroy()
+                            del self.file_bars[key]
 
-                    # Atualiza ou cria novas barras
-                    for doc in upload_docs:
+                    # Atualiza ou cria novas barras apenas para visíveis
+                    for doc in visible_docs:
                         name = doc.get("name", "Arquivo")
-                        status = doc.get("status", "uploading")
+                        status = doc.get("status", "queued")
+                        key = str(doc.get("_id", name))
                         total = doc.get("size", 1) or 1
-                        worker_id = doc.get("worker_id")
-                        
                         uploaded = doc.get("uploaded_bytes", 0)
-                        parts = doc.get("parts", [])
-                        bot_indexes = sorted({
-                            part.get("bot_index") + 1
-                            for part in parts
-                            if isinstance(part.get("bot_index"), int)
-                        })
+                        raw_parts = doc.get("parts")
+                        parts = raw_parts if isinstance(raw_parts, list) else []
+                        bot_indexes = upload_bot_indexes(parts) if status == "uploading" else []
                         if bot_indexes:
                             shown_bots = ", ".join(f"#{idx}" for idx in bot_indexes[:4])
                             remaining_bots = len(bot_indexes) - 4
                             bot_text = f"Bots usados {shown_bots}" + (f" +{remaining_bots}" if remaining_bots else "")
                         else:
-                            bot_text = "Bots rotativos"
+                            bot_text = "Bots rotativos" if status == "uploading" else ""
                         if uploaded > 0 and total > 0:
                             pct = (uploaded / total) * 100
                         elif parts:
@@ -1528,10 +2137,11 @@ class NebulaGUI:
                             pct = 0.0
 
                         display_name = doc.get("display_name", name)
-                        worker_text = f"Worker #{worker_id}" if worker_id is not None else "Worker ativo"
-                        info_text = f"Uploading | {worker_text} | {bot_text} | {display_name[:50]}"
+                        status_text = upload_status_label(doc)
+                        details = " | ".join(part for part in (status_text, bot_text, display_name) if part)
+                        info_text = details
 
-                        if name not in self.file_bars:
+                        if key not in self.file_bars:
                             item_frame = tk.Frame(self.scroll_content, bg="#313244", pady=6, padx=10)
                             item_frame.pack(fill="x", expand=True, pady=4, padx=5)
 
@@ -1541,17 +2151,21 @@ class NebulaGUI:
                             pframe = tk.Frame(item_frame, bg="#313244")
                             pframe.pack(fill="x", pady=2)
 
-                            pbar = ttk.Progressbar(pframe, length=400, mode="determinate")
+                            pbar = ttk.Progressbar(pframe, length=100, mode="determinate")
                             pbar.pack(side="left", fill="x", expand=True, padx=(0, 10))
 
-                            lbl_pct = tk.Label(pframe, text=f"{pct:.1f}%", font=("Consolas", 9, "bold"), bg="#313244", fg=self.accent_color, width=8)
+                            lbl_pct = tk.Label(pframe, text=f"{pct:.1f}%", font=("Consolas", 9, "bold"), bg="#313244", fg=self.accent_color, width=11, anchor="e")
                             lbl_pct.pack(side="right")
 
-                            self.file_bars[name] = {"frame": item_frame, "pbar": pbar, "pct_lbl": lbl_pct, "name_lbl": lbl_name}
+                            self.file_bars[key] = {"frame": item_frame, "pbar": pbar, "pct_lbl": lbl_pct, "name_lbl": lbl_name}
 
-                        self.file_bars[name]["name_lbl"].config(text=info_text)
-                        self.file_bars[name]["pbar"]["value"] = pct
-                        self.file_bars[name]["pct_lbl"].config(text=f"{pct:.1f}%")
+                        self.file_bars[key]["name_lbl"].config(text=info_text)
+                        self.file_bars[key]["pbar"]["value"] = pct
+                        if uploaded or parts or status == "uploading":
+                            progress_text = f"{pct:.1f}%"
+                        else:
+                            progress_text = "Aguardando"
+                        self.file_bars[key]["pct_lbl"].config(text=progress_text)
 
                 except Exception:
                     pass

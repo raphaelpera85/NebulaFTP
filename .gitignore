@@ -29,6 +29,9 @@ strm_library/
 
 # Local tool configs (may contain credentials)
 rclone-nebula.conf
+m3u_strm_config.json
+m3u_priority.json
+m3u_strm_catalog.json
 
 # IDE / editor
 .idea/

@@ -1171,7 +1171,7 @@ async def test_queued_mongo_scanner_requests_oldest_first(tmp_path, monkeypatch)
         pass
 
     assert len(captured_calls) >= 1
-    assert captured_calls[0]["sort"] == [("mtime", 1), ("ctime", 1), ("_id", 1)]
+    assert captured_calls[0]["sort"] == [("priority", -1), ("mtime", 1), ("ctime", 1), ("_id", 1)]
     assert not queue.empty()
     item = queue.get_nowait()
     assert item["filename"] == "old.mkv"

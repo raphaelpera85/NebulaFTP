@@ -94,7 +94,7 @@ def eligible_strm_targets(completed_files, output_root, library_user):
         parts = list(PurePosixPath(str(doc.get("parent", ""))).parts)
         if parts and parts[0] == "/":
             parts.pop(0)
-        if not parts or parts[0] != library_user:
+        if not parts or parts[0].casefold() != str(library_user).casefold():
             continue
         target_dir = output_root / Path(*(safe_windows_name(part) for part in parts[1:]))
         stem = Path(name).stem

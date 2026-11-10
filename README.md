@@ -160,6 +160,9 @@ python main.py
    - Geração incremental a partir dos arquivos concluídos no MongoDB
    - Reconciliação pelo ID, preservação de conflitos e reparo de nomes genéricos
 
+6. **[📤 Fila de upload e painel da GUI](docs/UPLOAD_QUEUE.md)**
+7. **[⬇️ Downloader STRM em lotes](docs/STRM_DOWNLOADER.md)**
+
 ---
 
 ### 🏗️ Ecossistema Nebula

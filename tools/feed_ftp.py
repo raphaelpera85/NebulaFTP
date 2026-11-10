@@ -11,6 +11,7 @@ import queue
 import re
 import shutil
 import socket
+import ssl
 import tempfile
 import sys
 import threading
@@ -25,6 +26,34 @@ from bson import ObjectId
 from dotenv import load_dotenv
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError, PyMongoError
+
+# --- RESILIÊNCIA DE REDE / DNS / SSL ---
+# Evita DNS hijacking / sinkholing IPv6 praticado por operadoras/roteadores em domínios de
+# streaming/CDN (que causam [SSL: TLSV1_UNRECOGNIZED_NAME]) forçando preferência por IPv4.
+_ORIGINAL_GETADDRINFO = socket.getaddrinfo
+
+
+def _ipv4_preferred_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    if family == 0:
+        try:
+            return _ORIGINAL_GETADDRINFO(host, port, socket.AF_INET, type, proto, flags)
+        except socket.gaierror:
+            pass
+    return _ORIGINAL_GETADDRINFO(host, port, family, type, proto, flags)
+
+
+socket.getaddrinfo = _ipv4_preferred_getaddrinfo
+
+# Contexto SSL permissivo para CDNs / streamings com certificados SNI flexíveis
+try:
+    _ssl_ctx = ssl.create_default_context()
+    _ssl_ctx.check_hostname = False
+    _ssl_ctx.verify_mode = ssl.CERT_NONE
+    ssl._create_default_https_context = lambda: _ssl_ctx
+except Exception:
+    pass
+
+load_dotenv()
 
 UPLOADABLE_EXTENSIONS = {
     ".mkv", ".mp4", ".avi", ".mov", ".wmv", ".m4v",
