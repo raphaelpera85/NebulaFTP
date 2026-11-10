@@ -162,6 +162,8 @@ python main.py
 
 6. **[📤 Fila de upload e painel da GUI](docs/UPLOAD_QUEUE.md)**
 7. **[⬇️ Downloader STRM em lotes](docs/STRM_DOWNLOADER.md)**
+8. **[📺 Sincronização M3U → STRM](docs/M3U_STRM_SYNC.md)**
+   - Modelo sem credenciais: `m3u_strm_config.example.json`
 
 ---
 

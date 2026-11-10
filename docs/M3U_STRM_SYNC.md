@@ -25,8 +25,10 @@ o disco. Cada link contém a URL de um filme ou episódio.
    mais linhas e use **Priorizar selecionada**.
 
 A URL fica em `m3u_strm_config.json`, o catálogo pesquisável em
-`m3u_strm_catalog.json` e as prioridades em `m3u_priority.json`. Esses arquivos
-são locais e não devem ser versionados quando contiverem credenciais.
+`m3u_strm_catalog.json` e as prioridades em `m3u_priority.json`. Há um modelo
+sem credenciais em `m3u_strm_config.example.json`; copie-o para
+`m3u_strm_config.json` e preencha a URL somente na máquina de destino. Esses
+arquivos são locais e não devem ser versionados quando contiverem credenciais.
 
 ## Categorização
 

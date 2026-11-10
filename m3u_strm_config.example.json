@@ -1,0 +1,6 @@
+{
+  "m3u_url": "@url:`https://provider.example/get.php?username=SEU_USUARIO&password=SUA_SENHA&type=m3u_plus&output=ts`",
+  "dest_root": "D:\\midias",
+  "interval_minutes": 60,
+  "fix_recovery": true
+}
